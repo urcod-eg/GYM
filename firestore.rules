@@ -24,22 +24,33 @@ service cloud.firestore {
     function licensePath()  { return /databases/$(database)/documents/license/main; }
     function configPath()   { return /databases/$(database)/documents/gymPublicConfig/main; }
     function counterPath()  { return /databases/$(database)/documents/counters/members; }
+    function sessionPath(u) { return /databases/$(database)/documents/staffSessions/$(u); }
+    function triesPath(u)   { return /databases/$(database)/documents/pinTries/$(u); }
+    function secretPath(u)  { return /databases/$(database)/documents/pinSecrets/$(u); }
 
     // ---------------------------------------------------------------- who is asking
     function signedIn() { return request.auth != null; }
     function me() { return get(userPath(request.auth.uid)).data; }
     function active() { return signedIn() && exists(userPath(request.auth.uid)) && me().status == 'active'; }
-    function hasRole(r) { return active() && r in me().roles; }
+    // Staff roles count only in a session opened with the 4-digit code for this very sign-in
+    // (auth_time changes with every new sign-in, so a stolen password alone is not enough).
+    function staffSessionOk() {
+      return exists(sessionPath(request.auth.uid))
+        && get(sessionPath(request.auth.uid)).data.authTime == request.auth.token.auth_time;
+    }
+    // Staff and the developer: roles count only after the second step (code / code + security phrase).
+    function hasRole(r) { return active() && r in me().roles && (me().kind == 'member' || staffSessionOk()); }
     function isDev() { return hasRole('developer'); }
     function isAdmin() { return hasRole('admin') || isDev(); }
     function isAccountant() { return hasRole('accountant'); }
     function isCashier() { return hasRole('cashier'); }
     function isCoach() { return hasRole('coach'); }
-    function isStaff() { return active() && me().kind in ['staff', 'developer']; }
+    function isStaff() { return active() && me().kind in ['staff', 'developer'] && staffSessionOk(); }
     function isFrontDesk() { return isAdmin() || isAccountant() || isCashier(); }
 
-    // Developer writes need a second factor in this sign-in session.
-    function devMfa() { return isDev() && request.auth.token.firebase.get('sign_in_second_factor', null) != null; }
+    // Developer writes need the developer's own session (code + security phrase for this sign-in).
+    // isDev() already includes it through hasRole(); the name stays for readability.
+    function devMfa() { return isDev(); }
 
     function licensed() {
       return exists(licensePath())
@@ -47,6 +58,12 @@ service cloud.firestore {
         && (get(licensePath()).data.endsAt == null || request.time < get(licensePath()).data.endsAt);
     }
     function adminWriter() { return (hasRole('admin') && licensed()) || devMfa(); }
+    // Managing another staff account: never yourself; admins only non-admins; the developer (2FA) anyone.
+    function canManageStaff(u) {
+      let t = get(userPath(u)).data;
+      return signedIn() && u != request.auth.uid && t.kind == 'staff'
+        && (devMfa() || (hasRole('admin') && licensed() && !('admin' in t.roles)));
+    }
     function frontDeskWriter() { return ((hasRole('admin') || hasRole('cashier')) && licensed()) || devMfa(); }
 
     // A block counts until its `until` time (null = until lifted).
@@ -129,6 +146,8 @@ service cloud.firestore {
       allow get: if true;
       allow create: if aliasWrite(a) && getAfter(invitePath(request.resource.data.inviteId)).data.prevUid == null;
       allow update: if aliasWrite(a) && getAfter(invitePath(request.resource.data.inviteId)).data.prevUid == resource.data.uid;
+      // Freed when an admin removes the staff account in the same write.
+      allow delete: if canManageStaff(resource.data.uid) && getAfter(userPath(resource.data.uid)).data.status == 'removed';
     }
     function aliasWrite(a) {
       let d = request.resource.data;
@@ -238,13 +257,96 @@ service cloud.firestore {
       let d = request.resource.data;
       return signedIn() && u != request.auth.uid
         && t.kind == 'staff' && t.status in ['active', 'disabled']
-        && onlyChanges(['roles', 'status', 'updatedAt', 'lastAuditId'])
-        && d.status in ['active', 'disabled']
+        && onlyChanges(['roles', 'status', 'displayName', 'updatedAt', 'lastAuditId'])
+        && d.status in ['active', 'disabled', 'removed']
         && d.roles is list && d.roles.size() > 0
+        && d.displayName is string && d.displayName.size() >= 2 && d.displayName.size() <= 80
         && d.updatedAt == request.time
         && ((devMfa() && d.roles.hasOnly(['admin', 'accountant', 'cashier', 'coach']))
             || (hasRole('admin') && licensed() && !('admin' in t.roles) && d.roles.hasOnly(['accountant', 'cashier', 'coach'])))
-        && freshAudit('staff.update', 'users', u);
+        && ((d.status == 'removed' && freshAudit('staff.remove', 'users', u))
+            || (d.status != 'removed' && freshAudit('staff.update', 'users', u)));
+    }
+
+    // ---------------------------------------------------------------- staff sign-in code (4-digit PIN)
+    // pinSecrets: salt + SHA-256(salt + code). No browser can read it; only these rules use it.
+    match /pinSecrets/{u} {
+      allow create, update: if (canManageStaff(u) || devOwnSecret(u))
+        && exactKeys(['salt', 'hash', 'setBy', 'setAt', 'lastAuditId'])
+        && request.resource.data.salt is string && request.resource.data.salt.matches('^[0-9a-f]{32}$')
+        && request.resource.data.hash is string && request.resource.data.hash.matches('^[0-9a-f]{64}$')
+        && request.resource.data.setBy == request.auth.uid
+        && request.resource.data.setAt == request.time
+        && ((canManageStaff(u) && freshAudit('staff.pin', 'pinSecrets', u))
+            || (devOwnSecret(u) && freshAudit('dev.secret', 'pinSecrets', u)));
+    }
+    // The developer sets their own code + phrase once (first sign-in), and may change it later
+    // only from an open session. Nobody else can set or reset it.
+    function devOwnSecret(u) {
+      return signedIn() && request.auth.uid == u && active() && me().kind == 'developer'
+        && ((resource == null && !exists(secretPath(u))) || (resource != null && staffSessionOk()))
+        && getAfter(/databases/$(database)/documents/devSetup/$(u)).data.at == request.time;
+    }
+    // devSetup: tells the developer's own app that the code is set (the secret itself stays unreadable).
+    match /devSetup/{u} {
+      allow get: if signedIn() && request.auth.uid == u;
+      allow create, update: if signedIn() && request.auth.uid == u && active() && me().kind == 'developer'
+        && exactKeys(['at']) && request.resource.data.at == request.time
+        && getAfter(secretPath(u)).data.setAt == request.time;
+    }
+    // pinTries: each attempt is written first and counted; 5 wrong in a row locks until an admin unlocks.
+    match /pinTries/{u} {
+      allow get: if signedIn() && (request.auth.uid == u || isAdmin());
+      allow list: if isAdmin();
+      allow create, update: if pinAttemptOk(u) || pinSuccessReset(u) || pinAdminReset(u);
+    }
+    function pinAttemptOk(u) {
+      let d = request.resource.data;
+      return signedIn() && request.auth.uid == u && active()
+        && exactKeys(['pin', 'count', 'authTime', 'at'])
+        && d.pin is string
+        && ((me().kind == 'staff' && d.pin.matches('^[0-9]{4}$'))
+            || (me().kind == 'developer' && d.pin.size() <= 140 && d.pin.matches('^[0-9]{4}:.{10,128}$')))
+        && d.authTime == request.auth.token.auth_time
+        && d.at == request.time
+        && ((resource == null && d.count == 1) || (resource != null && d.count == resource.data.count + 1))
+        && d.count <= 5;
+    }
+    function pinSuccessReset(u) {
+      let d = request.resource.data;
+      return signedIn() && request.auth.uid == u
+        && exactKeys(['pin', 'count', 'authTime', 'at'])
+        && d.pin == null && d.count == 0
+        && d.authTime == request.auth.token.auth_time && d.at == request.time
+        && getAfter(sessionPath(u)).data.authTime == request.auth.token.auth_time
+        && getAfter(sessionPath(u)).data.at == request.time;
+    }
+    function pinAdminReset(u) {
+      let d = request.resource.data;
+      return canManageStaff(u)
+        && exactKeys(['pin', 'count', 'authTime', 'at'])
+        && d.pin == null && d.count == 0 && d.authTime == 0 && d.at == request.time;
+    }
+    // staffSessions: opened by the staff member with the right code for this sign-in; ended by them or an admin.
+    match /staffSessions/{u} {
+      allow get: if signedIn() && (request.auth.uid == u || isAdmin());
+      allow list: if isAdmin();
+      allow create, update: if sessionOpen(u);
+      allow delete: if (signedIn() && request.auth.uid == u) || canManageStaff(u);
+    }
+    function sessionOpen(u) {
+      let d = request.resource.data;
+      let tries = get(triesPath(u)).data;
+      let secret = get(secretPath(u)).data;
+      return signedIn() && request.auth.uid == u && active() && me().kind in ['staff', 'developer']
+        && exactKeys(['authTime', 'device', 'at'])
+        && d.authTime == request.auth.token.auth_time
+        && d.at == request.time
+        && d.device is string && d.device.size() <= 120
+        && tries.authTime == request.auth.token.auth_time
+        && tries.count <= 5
+        && tries.pin is string
+        && hashing.sha256(secret.salt + tries.pin).toHexString().lower() == secret.hash;
     }
 
     match /members/{m} {
@@ -337,7 +439,8 @@ service cloud.firestore {
         && ((d.entityType == 'members' && getAfter(memberPath(d.entityId)).data.lastAuditId == aid)
             || (d.entityType == 'users' && getAfter(userPath(d.entityId)).data.lastAuditId == aid)
             || (d.entityType == 'license' && d.entityId == 'main' && getAfter(licensePath()).data.lastAuditId == aid)
-            || (d.entityType == 'gymPublicConfig' && d.entityId == 'main' && getAfter(configPath()).data.lastAuditId == aid));
+            || (d.entityType == 'gymPublicConfig' && d.entityId == 'main' && getAfter(configPath()).data.lastAuditId == aid)
+            || (d.entityType == 'pinSecrets' && getAfter(secretPath(d.entityId)).data.lastAuditId == aid));
     }
 
     // ---------------------------------------------------------------- later phases: read-only for now

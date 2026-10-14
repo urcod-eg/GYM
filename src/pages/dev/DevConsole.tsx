@@ -1,13 +1,12 @@
 import { useEffect, useState, type FormEvent } from 'react';
-import { multiFactor, sendEmailVerification, TotpMultiFactorGenerator, type TotpSecret } from 'firebase/auth';
 import { useApp } from '../../app/AppContext';
 import { useGym } from '../../app/GymContext';
-import { useActor, useSession } from '../../app/SessionContext';
+import { useActor } from '../../app/SessionContext';
 import { useErrorText } from '../../app/useErrorText';
 import { Icon } from '../../components/Icon';
 import { Shell } from '../../components/Shell';
 import { Notice } from '../../components/ui';
-import { demoMode, firebase } from '../../firebase/client';
+import { demoMode } from '../../firebase/client';
 import * as data from '../../firebase/data';
 import type { LicenseType } from '../../domain/writes';
 import type { StringKey } from '../../i18n/strings';
@@ -15,113 +14,23 @@ import { StaffManager } from '../staff/StaffManager';
 
 /**
  * Developer console (urcod only). The security rules accept these writes only from the developer
- * profile in a sign-in that used the second factor. The admin cannot open this page or write these documents.
+ * profile in a session opened with the code + security phrase. The admin cannot open this page or write these documents.
  */
 export function DevConsole() {
   const { t } = useApp();
-  const s = useSession();
-  const needMfa = !demoMode && !s.mfa;
   return (
     <Shell defaultTheme="dark" showCloud title={t('dev.title')} width="narrow" livePaths={['/dev']}>
       <div className="stack">
         <h1 className="page-title">{t('dev.title')}</h1>
         {demoMode && <Notice icon="info">{t('dev.demo')}</Notice>}
         <Notice icon="info">{t('dev.setupFirst')}</Notice>
-        <MfaCard />
-        <LicenseCard locked={needMfa} />
-        <BrandingCard locked={needMfa} />
+        <LicenseCard locked={false} />
+        <BrandingCard locked={false} />
         <section className="card">
-          {needMfa ? <Notice tone="warning" icon="shield">{t('dev.needMfa')}</Notice> : <StaffManager developer />}
+          <StaffManager developer />
         </section>
       </div>
     </Shell>
-  );
-}
-
-function MfaCard() {
-  const { t, toast } = useApp();
-  const errText = useErrorText();
-  const s = useSession();
-  const enrolled = !demoMode && !!s.user && multiFactor(s.user).enrolledFactors.some((f) => f.factorId === TotpMultiFactorGenerator.FACTOR_ID);
-  const [secret, setSecret] = useState<TotpSecret | null>(null);
-  const [code, setCode] = useState('');
-  const [err, setErr] = useState<string | null>(null);
-  const [verifySent, setVerifySent] = useState(false);
-  const unverified = !demoMode && !!s.user && !s.user.emailVerified;
-
-  // Firebase requires a verified e-mail before a second factor can be added.
-  const sendVerify = async () => {
-    setErr(null);
-    try {
-      const { auth } = await firebase();
-      await sendEmailVerification(auth.currentUser!);
-      setVerifySent(true);
-    } catch (e) {
-      setErr(errText(e));
-    }
-  };
-
-  const start = async () => {
-    setErr(null);
-    try {
-      const { auth } = await firebase();
-      await auth.currentUser!.reload();
-      if (!auth.currentUser!.emailVerified) return setErr(t('dev.verifyNeeded'));
-      const session = await multiFactor(auth.currentUser!).getSession();
-      setSecret(await TotpMultiFactorGenerator.generateSecret(session));
-    } catch (e) {
-      setErr(errText(e));
-    }
-  };
-  const verify = async (e: FormEvent) => {
-    e.preventDefault();
-    if (!secret) return;
-    try {
-      const { auth } = await firebase();
-      await multiFactor(auth.currentUser!).enroll(TotpMultiFactorGenerator.assertionForEnrollment(secret, code.trim()), 'Authenticator');
-      setSecret(null);
-      toast(t('dev.mfaDone'), 'success');
-    } catch (ex) {
-      setErr(errText(ex));
-    }
-  };
-
-  return (
-    <section className="card stack-sm">
-      <div className="row-between">
-        <h2 className="section-title">{t('dev.mfaTitle')}</h2>
-        <span className={`badge ${enrolled ? 'badge-success' : 'badge-warning'}`}>{enrolled ? t('dev.mfaBadgeOn') : t('dev.mfaBadgeOff')}</span>
-      </div>
-      <p className="small muted">{enrolled ? t('dev.mfaOn') : t('dev.mfaOff')}</p>
-      {enrolled && s.mfa && <p className="small">{t('dev.mfaSession')}</p>}
-      {enrolled && !s.mfa && <Notice tone="warning" icon="shield">{t('dev.needMfa')}</Notice>}
-      {!enrolled && unverified && (
-        <div className="stack-sm">
-          <p className="small">{t('dev.verifyNeeded')}</p>
-          <button type="button" className="btn btn-secondary btn-sm" style={{ alignSelf: 'flex-start' }} onClick={sendVerify} disabled={verifySent}>
-            {verifySent ? t('dev.verifySent') : t('dev.verifyEmail')}
-          </button>
-        </div>
-      )}
-      {!enrolled && !secret && (
-        <button className="btn btn-secondary" style={{ alignSelf: 'flex-start' }} disabled={demoMode} onClick={start}>
-          <Icon name="shield" />
-          {t('dev.mfaStart')}
-        </button>
-      )}
-      {secret && (
-        <form className="stack-sm" onSubmit={verify}>
-          <p className="small">{t('dev.mfaKey')}</p>
-          <code className="ltr" style={{ fontSize: '1.125rem', letterSpacing: '0.12em', wordBreak: 'break-all', padding: 12, background: 'var(--surface-2)', borderRadius: 10 }}>
-            {secret.secretKey}
-          </code>
-          <label className="label" htmlFor="mfa-code">{t('dev.code')}</label>
-          <input id="mfa-code" className="input ltr num" inputMode="numeric" maxLength={6} value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))} />
-          <button className="btn btn-primary" style={{ alignSelf: 'flex-start' }}>{t('dev.mfaVerify')}</button>
-        </form>
-      )}
-      {err && <span className="error" role="alert">{err}</span>}
-    </section>
   );
 }
 

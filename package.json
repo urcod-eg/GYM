@@ -11,8 +11,8 @@
     "lint:rules": "eslint -c eslint.rules.config.js firestore.rules",
     "test:rules": "firebase emulators:exec --only firestore --project demo-gym \"vitest run -c vitest.rules.config.ts\"",
     "test:all": "npm run typecheck && npm test && npm run lint:rules && npm run test:rules",
-    "emulators": "firebase emulators:start --only auth,firestore,hosting --project demo-gym",
-    "deploy": "npm run build && firebase deploy --only firestore,hosting"
+    "emulators": "firebase emulators:start --only auth,firestore --project demo-gym",
+    "deploy": "firebase deploy --only firestore"
   },
   "author": "urcod — Mahmoud Gamal Eldeen",
   "license": "UNLICENSED",

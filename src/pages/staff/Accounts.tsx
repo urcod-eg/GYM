@@ -183,7 +183,7 @@ function MemberCard({ m, admin, canWrite }: { m: MemberDoc; admin: boolean; canW
       <div className="row wrap" style={{ gap: 8 }}>
         {pending && (
           <button className="btn btn-success btn-sm" onClick={() => setDialog('activate')} disabled={!canWrite}>
-            <Icon name="whatsapp" />
+            <Icon name="lock" />
             {t('acc.sendActivation')}
           </button>
         )}
@@ -279,23 +279,23 @@ function RegisterModal({ onClose, existing }: { onClose: () => void; existing: M
 /* ---------------------------------------------------------------- invite links */
 
 function InviteDialog({ m, purpose, onClose }: { m: MemberDoc; purpose: 'activate' | 'reset'; onClose: () => void }) {
-  const { t, lang } = useApp();
+  const { t } = useApp();
   const gym = useGym();
   const actor = useActor();
   const errText = useErrorText();
   const [check, setCheck] = useState<string | null>(null);
-  const [url, setUrl] = useState<string | null>(null);
+  const [password, setPassword] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const create = async () => {
     setErr(null);
     if (purpose === 'reset' && !check) return setErr(t('err.identity-check-required'));
-    if (demoMode) return setUrl('https://pulse-gym.web.app/#/activate?c=…');
+    if (demoMode) return setPassword('bmtq4827');
     setBusy(true);
     try {
-      const r = await data.createMemberInvite(actor, m, purpose, check ?? undefined);
-      setUrl(r.url);
+      const r = await data.createMemberLogin(actor, m, purpose, check ?? undefined);
+      setPassword(r.password);
     } catch (e) {
       setErr(errText(e));
     } finally {
@@ -303,7 +303,7 @@ function InviteDialog({ m, purpose, onClose }: { m: MemberDoc; purpose: 'activat
     }
   };
 
-  // Activation links are created straight away (once, even under StrictMode); resets wait for the identity check.
+  // A new member's account is created straight away (once, even under StrictMode); resets wait for the identity check.
   const started = useRef(false);
   useEffect(() => {
     if (purpose === 'activate' && !started.current) {
@@ -313,23 +313,15 @@ function InviteDialog({ m, purpose, onClose }: { m: MemberDoc; purpose: 'activat
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const gymName = lang === 'ar' ? gym.nameAr : gym.nameEn;
-  const text = !url
+  const appUrl = window.location.href.split('#')[0];
+  const text = !password
     ? ''
-    : purpose === 'activate'
-      ? [
-          `🏋️ أهلًا بك في *${gym.nameAr}*، كابتن *${m.fullName}*! 💪`,
-          `🏷️ رقم العضوية: *${m.memberCode}*`,
-          `📱 تطبيق الجيم: ${url.split('#')[0]}`,
-          `🔐 رابط تفعيل حسابك واختيار كلمة السر (صالح 24 ساعة ولمرة واحدة): ${url}`,
-          'بعد التفعيل هتدخل برقم موبايلك وكلمة السر. 🔥',
-        ].join('\n')
-      : t('invite.waReset', { name: m.fullName, gym: gymName, url });
+    : t(purpose === 'activate' ? 'cred.waMember' : 'cred.waReset', { gym: gym.nameAr, name: m.fullName, code: m.memberCode, url: appUrl, phone: formatEgyptPhone(m.phoneE164), password });
 
   return (
-    <Modal open onClose={onClose} title={purpose === 'activate' ? t('wa.title') : t('reset.title')}>
+    <Modal open onClose={onClose} title={purpose === 'activate' ? t('cred.title') : t('reset.title')}>
       <div className="stack">
-        {purpose === 'reset' && !url && (
+        {purpose === 'reset' && !password && (
           <>
             <p className="small">{t('reset.body')}</p>
             <div className="field">
@@ -347,11 +339,40 @@ function InviteDialog({ m, purpose, onClose }: { m: MemberDoc; purpose: 'activat
             </button>
           </>
         )}
-        {purpose === 'activate' && !url && !err && <p className="muted" aria-busy="true">{t('wa.generating')}</p>}
+        {purpose === 'activate' && !password && !err && <p className="muted" aria-busy="true">{t('cred.creating')}</p>}
         {err && <Notice tone="danger" icon="alert">{err}</Notice>}
-        {url && <ShareText text={text} phone={m.phoneE164} />}
+        {password && <Credentials phone={m.phoneE164} password={password} text={text} />}
       </div>
     </Modal>
+  );
+}
+
+/** The new sign-in details, shown once, with the WhatsApp message ready to send. */
+export function Credentials({ phone, password, pin, text }: { phone: string; password?: string; pin?: string; text: string }) {
+  const { t } = useApp();
+  return (
+    <>
+      <div className="card card-flat stack-sm">
+        <div className="row-between">
+          <span className="muted small">{t('cred.user')}</span>
+          <bdi dir="ltr" className="bold" style={{ whiteSpace: 'nowrap', fontSize: '1.125rem' }}>{formatEgyptPhone(phone)}</bdi>
+        </div>
+        {password && (
+          <div className="row-between">
+            <span className="muted small">{t('cred.password')}</span>
+            <bdi dir="ltr" className="bold" style={{ fontSize: '1.25rem', letterSpacing: '0.08em' }}>{password}</bdi>
+          </div>
+        )}
+        {pin && (
+          <div className="row-between">
+            <span className="muted small">{t('cred.pin')}</span>
+            <bdi dir="ltr" className="bold" style={{ fontSize: '1.25rem', letterSpacing: '0.3em' }}>{pin}</bdi>
+          </div>
+        )}
+      </div>
+      <Notice tone="warning" icon="lock">{t('cred.once')}</Notice>
+      <ShareText text={text} phone={phone} />
+    </>
   );
 }
 
@@ -368,8 +389,8 @@ export function ShareText({ text, phone }: { text: string; phone: string }) {
   };
   return (
     <>
-      <textarea id="share-text" className="input" readOnly value={text} rows={8} style={{ padding: 12, minHeight: 200, lineHeight: 1.7 }} />
-      <p className="small muted">{demoMode ? t('wa.demoLink') : t('wa.manual')}</p>
+      <textarea id="share-text" className="input" readOnly value={text} rows={8} style={{ padding: 12, minHeight: 180, lineHeight: 1.7 }} />
+      <p className="small muted">{t('cred.manual')}</p>
       <div className="row wrap">
         <a className="btn btn-success grow" href={`https://wa.me/${phone.replace('+', '')}?text=${encodeURIComponent(text)}`} target="_blank" rel="noreferrer">
           <Icon name="whatsapp" />

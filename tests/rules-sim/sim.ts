@@ -11,6 +11,7 @@
  *     loudly so a gap is never mistaken for a denial.
  *   - Integers and floats are both JS numbers (`is int` means Number.isInteger).
  */
+import { createHash } from 'node:crypto';
 import * as antlrNs from 'antlr4';
 
 // The generated grammar is plain JavaScript in .ts files (@ts-nocheck). It is loaded through a
@@ -41,10 +42,13 @@ export class RDur {
 export class RPath {
   constructor(public readonly s: string) {}
 }
+export class RBytes {
+  constructor(public readonly buf: Buffer) {}
+}
 export class RDiff {
   constructor(public readonly a: RMap, public readonly b: RMap) {}
 }
-export type RV = null | boolean | number | string | RV[] | RMap | RSet | RTime | RDur | RPath | RDiff;
+export type RV = null | boolean | number | string | RV[] | RMap | RSet | RTime | RDur | RPath | RDiff | RBytes;
 
 /** Evaluation error: makes the surrounding condition fail (unless || / && can decide without it). */
 export class RErr extends Error {}
@@ -67,6 +71,7 @@ function typeOf(v: RV): string {
   if (v instanceof RDur) return 'duration';
   if (v instanceof RPath) return 'path';
   if (v instanceof RDiff) return 'map_diff';
+  if (v instanceof RBytes) return 'bytes';
   return 'unknown';
 }
 
@@ -85,6 +90,7 @@ export function eq(a: RV, b: RV): boolean {
   if (a instanceof RTime) return b instanceof RTime && a.ms === b.ms;
   if (a instanceof RDur) return b instanceof RDur && a.ms === b.ms;
   if (a instanceof RPath) return b instanceof RPath && a.s === b.s;
+  if (a instanceof RBytes) return b instanceof RBytes && a.buf.equals(b.buf);
   return false;
 }
 
@@ -572,6 +578,12 @@ function nsCall(ns: string, name: string, args: RV[]): RV {
     if (typeof n !== 'number' || typeof u !== 'string' || !(u in UNIT_MS)) fail('duration.value');
     return new RDur((n as number) * UNIT_MS[u as string]);
   }
+  if (ns === 'hashing' && name === 'sha256') {
+    const v = args[0];
+    if (typeof v === 'string') return new RBytes(createHash('sha256').update(v, 'utf8').digest());
+    if (v instanceof RBytes) return new RBytes(createHash('sha256').update(v.buf).digest());
+    return fail('hashing.sha256 needs a string or bytes');
+  }
   if (ns === 'timestamp' && name === 'value') return typeof args[0] === 'number' ? new RTime(args[0]) : fail('timestamp.value');
   throw new SimGap(`${ns}.${name}`);
 }
@@ -673,6 +685,10 @@ function method(o: RV, name: string, args: RV[]): RV {
     }
   }
   if (o instanceof RTime && name === 'toMillis') return o.ms;
+  // The real runtime's hex case is not documented; the rules lower-case it before comparing.
+  if (o instanceof RBytes && name === 'toHexString') return o.buf.toString('hex').toUpperCase();
+  if (o instanceof RBytes && name === 'toBase64') return o.buf.toString('base64');
+  if (o instanceof RBytes && name === 'size') return o.buf.length;
   if (o === null) return fail(`.${name}() on null`);
   throw new SimGap(`method ${typeOf(o)}.${name}`);
 }

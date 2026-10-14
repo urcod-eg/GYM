@@ -23,7 +23,7 @@ function dbFor(auth: AuthSpec | null) {
   if (!auth) return env.unauthenticatedContext().firestore();
   const firebase: Record<string, string> = { sign_in_provider: 'password' };
   if (auth.mfa) firebase.sign_in_second_factor = 'totp';
-  return env.authenticatedContext(auth.uid, { email: auth.email, firebase } as never).firestore();
+  return env.authenticatedContext(auth.uid, { email: auth.email, firebase, auth_time: auth.authTime ?? 1_700_000_000 } as never).firestore();
 }
 
 const harness: Harness = {

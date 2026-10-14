@@ -8,7 +8,7 @@ import { ArtTile, Modal, Notice, Toasts } from '../../components/ui';
 import { normalizeEgyptPhone } from '../../domain/text';
 import { isIOS, promptInstall, useInstallState } from '../../app/install';
 import { demoMode, firebase } from '../../firebase/client';
-import { openInvite, phoneSignIn, readProfile, redeem } from '../../firebase/data';
+import { openInvite, phoneSignIn, readProfile, redeem, setRemember } from '../../firebase/data';
 import type { InviteDoc } from '../../domain/writes';
 import { useErrorText } from '../../app/useErrorText';
 import { homeFor, useSession } from '../../app/SessionContext';
@@ -290,6 +290,7 @@ function StaffPhoneForm({ title, onDone, demoRoles }: { title: string; onDone: (
   const errText = useErrorText();
   const [phone, setPhone] = useState('');
   const [pw, setPw] = useState('');
+  const [remember, setRememberChoice] = useState(true);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const submit = async (e: FormEvent) => {
@@ -299,8 +300,9 @@ function StaffPhoneForm({ title, onDone, demoRoles }: { title: string; onDone: (
     setErr(null);
     setBusy(true);
     try {
+      await setRemember(remember);
       const p = await phoneSignIn('staff', phone, pw);
-      onDone(p.roles);
+      onDone(p.roles); // the 4-digit code is asked next, on the protected screen
     } catch (ex) {
       setErr(errText(ex));
     } finally {
@@ -325,6 +327,13 @@ function StaffPhoneForm({ title, onDone, demoRoles }: { title: string; onDone: (
           <input id="spw" className="input" type="password" autoComplete="current-password" value={pw} onChange={(e) => setPw(e.target.value)} />
         </div>
       </div>
+      <label className="check-row" htmlFor="remember">
+        <input id="remember" type="checkbox" checked={remember} onChange={(e) => setRememberChoice(e.target.checked)} />
+        <span className="stack-sm" style={{ gap: 2 }}>
+          <span>{t('login.remember')}</span>
+          <span className="hint">{t('login.rememberHint')}</span>
+        </span>
+      </label>
       {err && <span className="error" role="alert">{err}</span>}
       <button className="btn btn-primary btn-lg btn-block" disabled={busy} aria-busy={busy}>{t('login.submit')}</button>
     </form>

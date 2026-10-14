@@ -4,10 +4,10 @@
  * atomically. The rules decide; checks here only give a clearer message before trying.
  */
 import type { Unsubscribe } from 'firebase/firestore';
-import { firebase } from './client';
+import { firebase, secondaryFirebase } from './client';
 import { applyOps, commitOps, fromSdk } from './commit';
 import * as W from '../domain/writes';
-import { aliasId, inviteIdOf, inviteUrl, isInviteCode, newInviteCode, newLoginEmail, passwordProblem, type PersonKind } from '../domain/identity';
+import { aliasId, hashPin, inviteIdOf, isInviteCode, newInviteCode, newLoginEmail, newPassword, newPin, newSalt, passwordProblem, type PersonKind } from '../domain/identity';
 import { normalizeEgyptPhone } from '../domain/text';
 
 /** A refusal with a reason the UI translates (`err.<reason>`). */
@@ -140,27 +140,192 @@ export async function redeem(code: string, password: string): Promise<W.InviteDo
   return invite;
 }
 
-async function writeInvite(build: (inviteId: string) => W.WriteOp[]): Promise<{ url: string; expiresAt: Date }> {
+/**
+ * Creates the sign-in account directly and returns its generated password, which the staff member
+ * sends on WhatsApp. Under the hood it is the same invite → redeem pair the security rules check:
+ * the invite is written as the staff member, then redeemed at once in a separate in-memory app as
+ * the new account. The invite code never leaves this function.
+ */
+async function issueCredentials(kind: PersonKind, build: (inviteId: string) => W.WriteOp[]): Promise<{ password: string; uid: string }> {
   const code = newInviteCode();
   const id = await inviteIdOf(code);
   const ops = build(id);
-  const [{ db }] = await Promise.all([firebase()]);
+  const { db } = await firebase();
   await commitOps(db, ops);
-  return { url: inviteUrl(window.location.href, code), expiresAt: ops[0].data.expiresAt as Date };
+  const invite = ops[0].data as unknown as W.InviteDoc;
+  const password = newPassword();
+  const email = newLoginEmail(kind);
+  const [second, A] = await Promise.all([secondaryFirebase(), authMod()]);
+  let uid = '';
+  try {
+    const cred = await A.createUserWithEmailAndPassword(second.auth, email, password);
+    uid = cred.user.uid;
+    try {
+      await commitOps(second.db, W.redeemInvite({ uid: cred.user.uid, email, inviteId: id, invite, now: new Date() }));
+    } catch (e) {
+      await cred.user.delete().catch(() => undefined);
+      throw e;
+    }
+  } catch (e) {
+    await commitOps(db, [{ type: 'delete', path: `invites/${id}` }]).catch(() => undefined);
+    throw e;
+  } finally {
+    await second.close();
+  }
+  return { password, uid };
 }
 
-export function createMemberInvite(actor: Actor, member: Pick<MemberDoc, 'id' | 'fullName' | 'phoneE164' | 'authUid'>, purpose: 'activate' | 'reset', identityCheck?: string) {
-  return writeInvite((inviteId) => W.memberInvite({ actorUid: actor.uid, actorRoles: actor.roles, inviteId, member, purpose, identityCheck, now: new Date() }));
+/** New member account (`activate`) or a new password for an existing one (`reset`, admin only). */
+export function createMemberLogin(actor: Actor, member: Pick<MemberDoc, 'id' | 'fullName' | 'phoneE164' | 'authUid'>, purpose: 'activate' | 'reset', identityCheck?: string) {
+  return issueCredentials('member', (inviteId) => W.memberInvite({ actorUid: actor.uid, actorRoles: actor.roles, inviteId, member, purpose, identityCheck, now: new Date() }));
 }
 
-export async function createStaffInvite(actor: Actor, input: { phone: string; displayName: string; roles: string[]; purpose: 'activate' | 'reset'; target?: StaffAccount | null }) {
+/** New staff account, or a new password for an existing one (`target`). */
+export async function createStaffLogin(actor: Actor, input: { phone: string; displayName: string; roles: string[]; target?: StaffAccount | null }) {
   const phone = normalizeEgyptPhone(input.phone) ?? failWith('invalid-phone');
   const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
   const alias = await fs.getDoc(fs.doc(db, 'loginAliases', aliasId('staff', phone)));
   const aliasOwner = alias.exists() ? (alias.data().uid as string) : null;
-  return writeInvite((inviteId) =>
-    W.staffInvite({ actorUid: actor.uid, actorRoles: actor.roles, inviteId, phone, displayName: input.displayName, roles: input.roles, purpose: input.purpose, target: input.target, aliasOwner, now: new Date() }),
+  const roles = [...new Set(input.roles)].sort();
+  const { password, uid } = await issueCredentials('staff', (inviteId) =>
+    W.staffInvite({ actorUid: actor.uid, actorRoles: actor.roles, inviteId, phone, displayName: input.displayName, roles, purpose: input.target ? 'reset' : 'activate', target: input.target, aliasOwner, now: new Date() }),
   );
+  // Every staff account (new, or a new sign-in after a reset) also gets its own 4-digit code.
+  const pin = await setPinFor(actor, { uid, kind: 'staff', roles, status: 'active', displayName: input.displayName, phone });
+  return { password, pin };
+}
+
+/** Gives a staff account a new 4-digit code (stored only as a salted hash) and returns it to send. */
+export async function setPinFor(actor: Actor, target: StaffAccount): Promise<string> {
+  const pin = newPin();
+  const salt = newSalt();
+  const [{ db }, auditId, hash] = await Promise.all([firebase(), newId(), hashPin(salt, pin)]);
+  await commitOps(db, W.setStaffPin({ actorUid: actor.uid, actorRoles: actor.roles, auditId, target, salt, hash }));
+  return pin;
+}
+
+// ------------------------------------------------------------------ staff sessions (4-digit code)
+
+/** The sign-in time of the current Firebase session, as the rules see it (auth_time, seconds). */
+export async function currentAuthTime(): Promise<number | null> {
+  const { auth } = await firebase();
+  if (!auth.currentUser) return null;
+  return Number((await auth.currentUser.getIdTokenResult()).claims.auth_time ?? 0) || null;
+}
+
+export async function watchOwnStaffSession(uid: string, cb: (authTime: number | null) => void): Promise<Unsubscribe> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  return fs.onSnapshot(
+    fs.doc(db, 'staffSessions', uid),
+    (s) => cb(s.exists() ? Number(s.data().authTime) : null),
+    () => cb(null),
+  );
+}
+
+/**
+ * Enters the 4-digit code: the attempt is recorded (and counted) first, then the session is opened.
+ * The rules accept the session only if the recorded attempt matches the stored hash.
+ */
+export async function enterPin(pin: string): Promise<void> {
+  if (!W.isPin(pin) && !W.isDevSecretValue(pin)) failWith('invalid-pin');
+  const [{ auth, db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const uid = auth.currentUser?.uid ?? failWith('sign-in-required');
+  const authTime = (await currentAuthTime()) ?? failWith('sign-in-required');
+  const triesDoc = await fs.getDoc(fs.doc(db, 'pinTries', uid));
+  const prev = triesDoc.exists() ? Number(triesDoc.data().count ?? 0) : 0;
+  if (prev >= W.PIN_MAX_TRIES) failWith('pin-locked');
+  try {
+    await commitOps(db, W.pinAttempt({ uid, pin, authTime, prevCount: prev }));
+  } catch (e) {
+    if ((e as { code?: string }).code === 'permission-denied') failWith('pin-locked');
+    throw e;
+  }
+  const device = navigator.userAgent.replace(/\s+/g, ' ').slice(0, 120);
+  try {
+    await commitOps(db, W.openStaffSession({ uid, authTime, device }));
+  } catch (e) {
+    if ((e as { code?: string }).code === 'permission-denied') {
+      const left = W.PIN_MAX_TRIES - (prev + 1);
+      throw new AppFailure(left > 0 ? `pin-wrong:${left}` : 'pin-locked');
+    }
+    throw e;
+  }
+}
+
+/** Whether the developer has already set their code + security phrase (the secret itself is unreadable). */
+export async function devSecretIsSet(): Promise<boolean> {
+  const [{ auth, db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const uid = auth.currentUser?.uid ?? failWith('sign-in-required');
+  return (await fs.getDoc(fs.doc(db, 'devSetup', uid))).exists();
+}
+
+/** First sign-in (or a change from an open session): the developer chooses the code + phrase. */
+export async function setupDevSecret(pin: string, phrase: string): Promise<void> {
+  if (!W.isPin(pin)) failWith('invalid-pin');
+  if (phrase.length < W.PHRASE_MIN || phrase.length > W.PHRASE_MAX) failWith('phrase-short');
+  const [{ auth, db }, auditId] = await Promise.all([firebase(), newId()]);
+  const uid = auth.currentUser?.uid ?? failWith('sign-in-required');
+  const salt = newSalt();
+  const hash = await hashPin(salt, W.devSecretValue(pin, phrase));
+  await commitOps(db, W.setDevSecret({ uid, auditId, salt, hash }));
+}
+
+/** Staff sign-out also closes their session, so the next sign-in needs the code again. */
+export async function endOwnStaffSession(uid: string) {
+  const { db } = await firebase();
+  await commitOps(db, W.endStaffSession(uid)).catch(() => undefined);
+}
+
+export interface StaffStatus {
+  sessions: Record<string, { at: Date | null; device: string }>;
+  lockedUids: string[];
+}
+
+/** For admins: who is signed in now and who is locked out after wrong codes. */
+export async function watchStaffStatus(cb: (s: StaffStatus) => void): Promise<Unsubscribe> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const state: StaffStatus = { sessions: {}, lockedUids: [] };
+  const a = fs.onSnapshot(
+    fs.collection(db, 'staffSessions'),
+    (s) => {
+      state.sessions = Object.fromEntries(s.docs.map((d) => [d.id, { at: fromSdk<Date | null>(d.data().at ?? null), device: String(d.data().device ?? '') }]));
+      cb({ ...state });
+    },
+    () => undefined,
+  );
+  const b = fs.onSnapshot(
+    fs.collection(db, 'pinTries'),
+    (s) => {
+      state.lockedUids = s.docs.filter((d) => Number(d.data().count) >= W.PIN_MAX_TRIES).map((d) => d.id);
+      cb({ ...state });
+    },
+    () => undefined,
+  );
+  return () => {
+    a();
+    b();
+  };
+}
+
+export async function endStaffSessionFor(target: StaffAccount) {
+  const { db } = await firebase();
+  await commitOps(db, W.endStaffSession(target.uid));
+}
+
+export async function unlockStaffPin(actor: Actor, target: StaffAccount) {
+  const { db } = await firebase();
+  await commitOps(db, W.unlockPin({ actorUid: actor.uid, actorRoles: actor.roles, target }));
+}
+
+export async function removeStaffAccount(actor: Actor, target: StaffAccount) {
+  const [{ db }, auditId] = await Promise.all([firebase(), newId()]);
+  await commitOps(db, W.removeStaff({ actorUid: actor.uid, actorRoles: actor.roles, auditId, target }));
+}
+
+/** Remember me: keep the sign-in on this device until sign-out, or only until the app/tab is closed. */
+export async function setRemember(remember: boolean) {
+  const [{ auth }, A] = await Promise.all([firebase(), authMod()]);
+  await A.setPersistence(auth, remember ? A.browserLocalPersistence : A.browserSessionPersistence);
 }
 
 // ------------------------------------------------------------------ members
@@ -222,7 +387,7 @@ export interface StaffAccount {
   uid: string;
   kind: string;
   roles: string[];
-  status: 'active' | 'disabled' | 'replaced';
+  status: 'active' | 'disabled' | 'replaced' | 'removed';
   displayName: string;
   phone: string;
 }
@@ -230,10 +395,10 @@ export interface StaffAccount {
 export async function watchStaff(cb: (rows: StaffAccount[]) => void, onError: (e: unknown) => void): Promise<Unsubscribe> {
   const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
   const q = fs.query(fs.collection(db, 'users'), fs.where('kind', '==', 'staff'));
-  return fs.onSnapshot(q, (s) => cb(s.docs.map((d) => ({ ...fromSdk<Omit<StaffAccount, 'uid'>>(d.data()), uid: d.id }) as StaffAccount).filter((x) => x.status !== 'replaced')), onError);
+  return fs.onSnapshot(q, (s) => cb(s.docs.map((d) => ({ ...fromSdk<Omit<StaffAccount, 'uid'>>(d.data()), uid: d.id }) as StaffAccount).filter((x) => x.status !== 'replaced' && x.status !== 'removed')), onError);
 }
 
-export async function updateStaffAccount(actor: Actor, target: StaffAccount, change: { roles?: string[]; status?: 'active' | 'disabled' }) {
+export async function updateStaffAccount(actor: Actor, target: StaffAccount, change: { roles?: string[]; status?: 'active' | 'disabled'; displayName?: string }) {
   const [{ db }, auditId] = await Promise.all([firebase(), newId()]);
   await commitOps(db, W.updateStaff({ actorUid: actor.uid, actorRoles: actor.roles, auditId, target, ...change }));
 }

@@ -4,6 +4,7 @@
  *   - tests/rules/firestore.rules.test.ts → the official Firestore emulator (`npm run test:rules`, Java 21, CI)
  * Every allowed write here is produced by the same builders the app uses (src/domain/writes.ts).
  */
+import { createHash } from 'node:crypto';
 import { describe, expect, it, beforeEach } from 'vitest';
 import {
   liftMemberBlock,
@@ -16,6 +17,14 @@ import {
   setMemberBlock,
   staffInvite,
   updateStaff,
+  removeStaff,
+  setStaffPin,
+  setDevSecret,
+  devSecretValue,
+  pinAttempt,
+  openStaffSession,
+  endStaffSession,
+  unlockPin,
   type InviteDoc,
   type WriteOp,
 } from '../../src/domain/writes';
@@ -24,7 +33,11 @@ export interface AuthSpec {
   uid: string;
   email?: string;
   mfa?: boolean;
+  /** The sign-in's auth_time (seconds). Defaults to SIGNED_IN_AT. */
+  authTime?: number;
 }
+/** auth_time of every seeded staff session. */
+export const SIGNED_IN_AT = 1_700_000_000;
 /** Loosely typed so tests can hand-craft hostile writes. */
 export type Op = { type: 'set' | 'update'; path: string; data: Record<string, unknown> } | { type: 'delete'; path: string };
 type Data = Record<string, unknown>;
@@ -57,8 +70,21 @@ function staffUser(roles: string[], phone: string, status = 'active') {
   return { kind: 'staff', roles, status, displayName: 'موظف', phone, memberId: null, inviteId: null, createdAt: new Date() };
 }
 
+const SALT = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
+const CASH_PIN = '4826';
+const sha = (x: string) => createHash('sha256').update(x, 'utf8').digest('hex');
+const session = (now: number) => ({ authTime: SIGNED_IN_AT, device: 'test', at: new Date(now) });
+
 function world(now: number): Record<string, Data> {
   return {
+    'staffSessions/dev': session(now),
+    'staffSessions/admin1': session(now),
+    'staffSessions/admin2': session(now),
+    'staffSessions/cash1': session(now),
+    'staffSessions/cash-off': session(now),
+    'staffSessions/coach1': session(now),
+    'staffSessions/acc1': session(now),
+    'pinSecrets/cash1': { salt: SALT, hash: sha(SALT + CASH_PIN), setBy: 'admin1', setAt: new Date(now), lastAuditId: 'seed-p' },
     'users/dev': { kind: 'developer', roles: ['developer'], status: 'active', displayName: 'Dev', phone: null, memberId: null, inviteId: null, createdAt: new Date(now) },
     'users/admin1': staffUser(['admin'], '+201500000001'),
     'users/admin2': staffUser(['admin'], '+201500000002'),
@@ -115,8 +141,9 @@ export function defineScenarios(name: string, h: Harness) {
     if (!h.isDenied(err)) throw err;
   };
 
-  const DEV = { uid: 'dev', email: 'dev@urcod.example', mfa: true };
-  const DEV_NO_MFA = { uid: 'dev', email: 'dev@urcod.example' };
+  // DEV has an open session (code + phrase entered for this sign-in); DEV_NO_MFA is a fresh sign-in without it.
+  const DEV = { uid: 'dev', email: 'dev@urcod.example' };
+  const DEV_NO_MFA = { uid: 'dev', email: 'dev@urcod.example', authTime: SIGNED_IN_AT + 999 };
   const ADMIN = { uid: 'admin1', email: semail(11) };
   const CASHIER = { uid: 'cash1', email: semail(1) };
   const CASHIER_OFF = { uid: 'cash-off', email: semail(4) };
@@ -297,7 +324,8 @@ export function defineScenarios(name: string, h: Harness) {
         const S = { uid: 'u-staff', email: semail(200) };
         await ok(h.as(S).commit(redeem(S, 37, inv)));
         expect((await h.peek('users/u-staff'))?.roles).toEqual(['cashier']);
-        await ok(h.as(S).get('members/mem1'));
+        // Staff powers start only after the 4-digit code opens a session.
+        await denied(h.as(S).get('members/mem1'));
       });
     });
 
@@ -392,6 +420,116 @@ export function defineScenarios(name: string, h: Harness) {
         await ok(h.as(DEV).commit(setBranding({ actorUid: 'dev', auditId: 'br-2', ...b })));
         const svg = setBranding({ actorUid: 'dev', auditId: 'br-3', ...b }).map((o) => (o.path === 'gymPublicConfig/main' ? { ...o, data: { ...o.data, logoDataUrl: 'data:image/svg+xml;base64,PHN2Zz4=' } } : o));
         await denied(h.as(DEV).commit(svg));
+      });
+    });
+
+    describe('staff sign-in code and sessions', () => {
+      const FRESH = { uid: 'cash1', email: semail(1), authTime: SIGNED_IN_AT + 500 };
+      const tries = async () => ((await h.peek('pinTries/cash1'))?.count as number | undefined) ?? 0;
+      const enter = async (pin: string) => {
+        await h.as(FRESH).commit(pinAttempt({ uid: 'cash1', pin, authTime: FRESH.authTime, prevCount: await tries() }));
+        await h.as(FRESH).commit(openStaffSession({ uid: 'cash1', authTime: FRESH.authTime, device: 'phone' }));
+      };
+      it('a password alone is not enough: a new sign-in has no staff powers until the code is entered', async () => {
+        await denied(h.as(FRESH).get('members/mem1'));
+        await denied(registerAs(FRESH, 'منى حسن', '01014445555'));
+        await ok(h.as(FRESH).get('users/cash1'));
+      });
+      it('the right code opens a session for this sign-in; a wrong one does not', async () => {
+        await denied(enter('1111'));
+        await ok(enter(CASH_PIN));
+        await ok(h.as(FRESH).get('members/mem1'));
+        await denied(h.as(CASHIER).get('members/mem1'));
+        expect(await tries()).toBe(0);
+      });
+      it('a session cannot be opened without a recorded attempt, or for another sign-in', async () => {
+        await denied(h.as(FRESH).commit(openStaffSession({ uid: 'cash1', authTime: FRESH.authTime, device: 'x' })));
+        await h.as(FRESH).commit(pinAttempt({ uid: 'cash1', pin: CASH_PIN, authTime: FRESH.authTime, prevCount: 0 }));
+        await denied(h.as(FRESH).commit(openStaffSession({ uid: 'cash1', authTime: FRESH.authTime + 1, device: 'x' })));
+      });
+      it('an attempt belongs to one sign-in and stays private', async () => {
+        await denied(h.as(FRESH).commit(pinAttempt({ uid: 'cash1', pin: CASH_PIN, authTime: FRESH.authTime + 7, prevCount: 0 })));
+        await h.as(FRESH).commit(pinAttempt({ uid: 'cash1', pin: CASH_PIN, authTime: FRESH.authTime, prevCount: 0 }));
+        const other = { ...FRESH, authTime: FRESH.authTime + 60 };
+        await denied(h.as(other).commit(openStaffSession({ uid: 'cash1', authTime: other.authTime, device: 'x' })));
+        await denied(h.as(COACH).get('pinTries/cash1'));
+        await denied(h.as(null).get('pinTries/cash1'));
+      });
+      it('five wrong codes lock the account until an admin unlocks it', async () => {
+        for (let i = 0; i < 5; i++) await denied(enter('0000'));
+        expect(await tries()).toBe(5);
+        await denied(h.as(FRESH).commit([{ type: 'set', path: 'pinTries/cash1', data: { pin: CASH_PIN, count: 6, authTime: FRESH.authTime, at: SERVER_TIME } }]));
+        await denied(h.as(FRESH).commit([{ type: 'set', path: 'pinTries/cash1', data: { pin: CASH_PIN, count: 0, authTime: FRESH.authTime, at: SERVER_TIME } }]));
+        await ok(h.as(ADMIN).commit(unlockPin({ actorUid: 'admin1', actorRoles: ['admin'], target: { uid: 'cash1', roles: ['cashier'], status: 'active', kind: 'staff' } })));
+        await ok(enter(CASH_PIN));
+      });
+      it('nobody can read the stored code, not even an admin', async () => {
+        await denied(h.as(FRESH).get('pinSecrets/cash1'));
+        await denied(h.as(ADMIN).get('pinSecrets/cash1'));
+        await denied(h.as(DEV).get('pinSecrets/cash1'));
+      });
+      it('admins set codes for their staff; not for admins, not for themselves', async () => {
+        const pin = (actor: AuthSpec, roles: string[], uid: string, targetRoles: string[], aid: string) =>
+          h.as(actor).commit(setStaffPin({ actorUid: actor.uid, actorRoles: roles, auditId: aid, target: { uid, roles: targetRoles, status: 'active', kind: 'staff' }, salt: SALT, hash: sha(SALT + '9999') }));
+        await ok(pin(ADMIN, ['admin'], 'cash1', ['cashier'], 'pin-1'));
+        await denied(h.as(CASHIER).get('members/mem1'));
+        await denied(pin(ADMIN, ['developer'], 'admin2', ['admin'], 'pin-2'));
+        await denied(pin(CASHIER, ['admin'], 'coach1', ['coach'], 'pin-3'));
+        await ok(pin(DEV, ['developer'], 'admin2', ['admin'], 'pin-4'));
+      });
+      it('an admin can end a staff session remotely; staff can end their own', async () => {
+        await denied(h.as(COACH).commit(endStaffSession('cash1')));
+        await ok(h.as(ADMIN).commit(endStaffSession('cash1')));
+        await denied(h.as(CASHIER).get('members/mem1'));
+        await ok(h.as(COACH).commit(endStaffSession('coach1')));
+        await denied(h.as(ADMIN).commit(endStaffSession('admin2')));
+      });
+      it('removing a staff account frees the phone and ends access', async () => {
+        await ok(h.as(ADMIN).commit(removeStaff({ actorUid: 'admin1', actorRoles: ['admin'], auditId: 'rm-1', target: { uid: 'cash1', roles: ['cashier'], status: 'active', kind: 'staff', phone: PHONE_CASH } })));
+        expect(await h.peek('loginAliases/s+201511111111')).toBeUndefined();
+        await denied(h.as(CASHIER).get('members/mem1'));
+        // An admin cannot remove another admin, even by bypassing the app's own check.
+        const forged = removeStaff({ actorUid: 'admin1', actorRoles: ['developer'], auditId: 'rm-2', target: { uid: 'admin2', roles: ['admin'], status: 'active', kind: 'staff', phone: '+201500000002' } });
+        await denied(h.as(ADMIN).commit(forged));
+      });
+      it('admins can rename staff', async () => {
+        await ok(h.as(ADMIN).commit(updateStaff({ actorUid: 'admin1', actorRoles: ['admin'], auditId: 'nm-1', target: { uid: 'coach1', roles: ['coach'], status: 'active', kind: 'staff' }, displayName: 'كابتن جديد' })));
+        expect((await h.peek('users/coach1'))?.displayName).toBe('كابتن جديد');
+      });
+    });
+
+    describe('developer second step (code + security phrase)', () => {
+      const NEW_DEV = { uid: 'dev2', email: 'dev2@urcod.example', authTime: SIGNED_IN_AT + 10 };
+      const devUser = { kind: 'developer', roles: ['developer'], status: 'active', displayName: 'Dev 2', phone: null, memberId: null, inviteId: null, createdAt: new Date() };
+      const secret = (pin: string, phrase: string) => ({ salt: SALT, hash: sha(SALT + devSecretValue(pin, phrase)) });
+      const enter = async (who: AuthSpec, value: string) => {
+        const prev = ((await h.peek(`pinTries/${who.uid}`))?.count as number | undefined) ?? 0;
+        await h.as(who).commit(pinAttempt({ uid: who.uid, pin: value, authTime: who.authTime!, prevCount: prev }));
+        await h.as(who).commit(openStaffSession({ uid: who.uid, authTime: who.authTime!, device: 'pc' }));
+      };
+      it('a developer without a session has no powers', async () => {
+        await denied(h.as(DEV_NO_MFA).get('members/mem1'));
+        await denied(h.as(DEV_NO_MFA).commit(setLicense({ actorUid: 'dev', auditId: 'l-x', prevVersion: 1, type: 'TRIAL', state: 'ACTIVE', startsAt: new Date(), days: 7, note: '' })));
+      });
+      it('first sign-in: the developer sets the code + phrase once, then needs them to open a session', async () => {
+        await h.seed({ 'users/dev2': devUser });
+        await ok(h.as(NEW_DEV).commit(setDevSecret({ uid: 'dev2', auditId: 'ds-1', ...secret('1234', 'very-strong-phrase') })));
+        expect(await h.peek('devSetup/dev2')).toBeTruthy();
+        // A second "first setup" (e.g. someone who stole the password later) is refused without a session.
+        const other = { ...NEW_DEV, authTime: NEW_DEV.authTime + 50 };
+        await denied(h.as(other).commit(setDevSecret({ uid: 'dev2', auditId: 'ds-2', ...secret('0000', 'attacker-phrase-x') })));
+        await denied(enter(NEW_DEV, devSecretValue('1234', 'wrong-phrase-here')));
+        await ok(enter(NEW_DEV, devSecretValue('1234', 'very-strong-phrase')));
+        await ok(h.as(NEW_DEV).get('members/mem1'));
+      });
+      it('nobody else can set or read the developer secret', async () => {
+        await h.seed({ 'users/dev2': devUser });
+        await denied(h.as(ADMIN).commit(setDevSecret({ uid: 'dev2', auditId: 'ds-3', ...secret('1111', 'admin-sets-this') })));
+        await denied(h.as(ADMIN).commit([
+          { type: 'set', path: 'pinSecrets/dev', data: { salt: SALT, hash: sha('x'), setBy: 'admin1', setAt: SERVER_TIME, lastAuditId: 'ds-4' } },
+          { type: 'set', path: 'auditLogs/ds-4', data: { actorUid: 'admin1', action: 'staff.pin', entityType: 'pinSecrets', entityId: 'dev', at: SERVER_TIME, summary: {} } },
+        ]));
+        await denied(h.as(DEV).get('pinSecrets/dev'));
       });
     });
 

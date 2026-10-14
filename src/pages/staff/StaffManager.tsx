@@ -11,7 +11,8 @@ import type { StaffAccount } from '../../firebase/data';
 import { rolesInviterMayGrant } from '../../domain/identity';
 import { formatEgyptPhone } from '../../domain/text';
 import type { StringKey } from '../../i18n/strings';
-import { ShareText, useLicenseOk } from './Accounts';
+import { Credentials, useLicenseOk } from './Accounts';
+import { normalizeEgyptPhone } from '../../domain/text';
 
 const DEMO_STAFF: StaffAccount[] = [
   { uid: 's1', kind: 'staff', roles: ['admin'], status: 'active', displayName: 'أ. خالد إبراهيم', phone: '+201001112223' },
@@ -36,6 +37,21 @@ function useStaff() {
   return { rows, error };
 }
 
+function useStaffStatus(): data.StaffStatus {
+  const [st, setSt] = useState<data.StaffStatus>(demoMode ? { sessions: { s1: { at: new Date(), device: '' }, s2: { at: new Date(), device: '' } }, lockedUids: ['s3'] } : { sessions: {}, lockedUids: [] });
+  useEffect(() => {
+    if (demoMode) return;
+    let stop: (() => void) | undefined;
+    let cancelled = false;
+    data.watchStaffStatus(setSt).then((u) => (cancelled ? u() : (stop = u)));
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
+  }, []);
+  return st;
+}
+
 const roleLabel = (t: (k: StringKey) => string, roles: string[]) => roles.map((r) => t(`role.${r}` as StringKey)).join('، ');
 
 /**
@@ -48,6 +64,7 @@ export function StaffManager({ developer = false }: { developer?: boolean }) {
   const roles = developer ? ['developer'] : actor.roles.filter((r) => r !== 'developer');
   const grantable = rolesInviterMayGrant(developer ? ['developer'] : roles);
   const { rows, error } = useStaff();
+  const status = useStaffStatus();
   const licenseOk = useLicenseOk();
   const canWrite = developer || licenseOk !== false;
   const [inviting, setInviting] = useState(false);
@@ -75,7 +92,7 @@ export function StaffManager({ developer = false }: { developer?: boolean }) {
       ) : (
         <div className="stack-sm">
           {list.map((s) => (
-            <StaffCard key={s.uid} s={s} grantable={grantable} actorRoles={developer ? ['developer'] : roles} self={s.uid === actor.uid} canWrite={canWrite} />
+            <StaffCard key={s.uid} s={s} grantable={grantable} actorRoles={developer ? ['developer'] : roles} self={s.uid === actor.uid} canWrite={canWrite} online={!!status.sessions[s.uid]} locked={status.lockedUids.includes(s.uid)} />
           ))}
         </div>
       )}
@@ -84,19 +101,22 @@ export function StaffManager({ developer = false }: { developer?: boolean }) {
   );
 }
 
-function StaffCard({ s, grantable, actorRoles, self, canWrite }: { s: StaffAccount; grantable: string[]; actorRoles: string[]; self: boolean; canWrite: boolean }) {
+type CardDialog = null | 'edit' | 'reset' | 'pin' | 'remove';
+
+function StaffCard({ s, grantable, actorRoles, self, canWrite, online, locked }: { s: StaffAccount; grantable: string[]; actorRoles: string[]; self: boolean; canWrite: boolean; online: boolean; locked: boolean }) {
   const { t, toast } = useApp();
   const actor = useActor();
   const errText = useErrorText();
-  const [dialog, setDialog] = useState<null | 'roles' | 'reset'>(null);
+  const [dialog, setDialog] = useState<CardDialog>(null);
   const manageable = !self && s.roles.every((r) => grantable.includes(r));
   const disabled = s.status === 'disabled';
+  const me = { ...actor, roles: actorRoles };
 
-  const toggle = async () => {
+  const run = async (fn: () => Promise<unknown>, done: StringKey) => {
     if (demoMode) return toast(t('app.demoNoSave'));
     try {
-      await data.updateStaffAccount({ ...actor, roles: actorRoles }, s, { status: disabled ? 'active' : 'disabled' });
-      toast(t('staff.saved'), 'success');
+      await fn();
+      toast(t(done), 'success');
     } catch (e) {
       toast(errText(e), 'danger');
     }
@@ -115,33 +135,109 @@ function StaffCard({ s, grantable, actorRoles, self, canWrite }: { s: StaffAccou
           </span>
           <div className="row wrap" style={{ gap: 6, marginTop: 4 }}>
             <span className="badge">{roleLabel(t, s.roles)}</span>
+            {online && !disabled && <span className="badge badge-success">{t('staff.online')}</span>}
+            {locked && <span className="badge badge-warning">{t('staff.locked')}</span>}
             {disabled && <span className="badge badge-danger">{t('staff.disabled')}</span>}
           </div>
         </div>
       </div>
       {manageable ? (
         <div className="row wrap" style={{ gap: 8 }}>
-          <button className="btn btn-secondary btn-sm" onClick={() => setDialog('roles')} disabled={!canWrite}>
+          <button className="btn btn-secondary btn-sm" onClick={() => setDialog('edit')} disabled={!canWrite}>
             <Icon name="edit" />
-            {t('staff.editRoles')}
+            {t('staff.edit')}
           </button>
           {!disabled && (
-            <button className="btn btn-secondary btn-sm" onClick={() => setDialog('reset')} disabled={!canWrite}>
-              <Icon name="lock" />
-              {t('staff.reset')}
+            <>
+              <button className="btn btn-secondary btn-sm" onClick={() => setDialog('reset')} disabled={!canWrite}>
+                <Icon name="lock" />
+                {t('staff.reset')}
+              </button>
+              <button className="btn btn-secondary btn-sm" onClick={() => setDialog('pin')} disabled={!canWrite}>
+                <Icon name="shield" />
+                {t('staff.newPin')}
+              </button>
+            </>
+          )}
+          {locked && (
+            <button className="btn btn-primary-soft btn-sm" onClick={() => run(() => data.unlockStaffPin(me, s), 'staff.unlocked')} disabled={!canWrite}>
+              <Icon name="check" />
+              {t('staff.unlock')}
             </button>
           )}
-          <button className={`btn btn-sm ${disabled ? 'btn-primary-soft' : 'btn-ghost'}`} onClick={toggle} disabled={!canWrite}>
+          {online && (
+            <button className="btn btn-ghost btn-sm" onClick={() => run(() => data.endStaffSessionFor(s), 'staff.sessionEnded')} disabled={!canWrite}>
+              <Icon name="logout" />
+              {t('staff.endSession')}
+            </button>
+          )}
+          <button className={`btn btn-sm ${disabled ? 'btn-primary-soft' : 'btn-ghost'}`} onClick={() => run(() => data.updateStaffAccount(me, s, { status: disabled ? 'active' : 'disabled' }), 'staff.saved')} disabled={!canWrite}>
             <Icon name={disabled ? 'check' : 'x'} />
             {disabled ? t('staff.enable') : t('staff.disable')}
+          </button>
+          <button className="btn btn-ghost btn-sm" style={{ color: 'var(--danger)' }} onClick={() => setDialog('remove')} disabled={!canWrite}>
+            <Icon name="trash" />
+            {t('staff.remove')}
           </button>
         </div>
       ) : (
         !self && s.roles.includes('admin') && <span className="muted xs">{t('staff.adminOnlyDev')}</span>
       )}
-      {dialog === 'roles' && <RolesDialog s={s} grantable={grantable} actorRoles={actorRoles} onClose={() => setDialog(null)} />}
+      {dialog === 'edit' && <EditDialog s={s} grantable={grantable} actorRoles={actorRoles} onClose={() => setDialog(null)} />}
       {dialog === 'reset' && <InviteStaff onClose={() => setDialog(null)} grantable={grantable} actorRoles={actorRoles} target={s} />}
+      {dialog === 'pin' && <NewPinDialog s={s} actorRoles={actorRoles} onClose={() => setDialog(null)} />}
+      {dialog === 'remove' && (
+        <Modal open onClose={() => setDialog(null)} title={t('staff.remove')}>
+          <div className="stack">
+            <p>{t('staff.removeConfirm', { name: s.displayName })}</p>
+            <div className="row wrap">
+              <button className="btn btn-danger-solid grow" onClick={() => run(() => data.removeStaffAccount(me, s), 'staff.removed').then(() => setDialog(null))}>
+                <Icon name="trash" />
+                {t('staff.remove')}
+              </button>
+              <button className="btn btn-secondary grow" onClick={() => setDialog(null)}>{t('app.cancel')}</button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </section>
+  );
+}
+
+/** New 4-digit code for an existing account (password unchanged); ends their current session. */
+function NewPinDialog({ s, actorRoles, onClose }: { s: StaffAccount; actorRoles: string[]; onClose: () => void }) {
+  const { t, lang } = useApp();
+  const gym = useGym();
+  const actor = useActor();
+  const errText = useErrorText();
+  const [pin, setPin] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const create = async () => {
+    setErr(null);
+    if (demoMode) return setPin('4826');
+    setBusy(true);
+    try {
+      setPin(await data.setPinFor({ ...actor, roles: actorRoles }, s));
+    } catch (e) {
+      setErr(errText(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Modal open onClose={onClose} title={`${t('staff.newPin')} — ${s.displayName}`}>
+      <div className="stack">
+        {pin ? (
+          <Credentials phone={s.phone} pin={pin} text={t('cred.waPin', { name: s.displayName, gym: lang === 'ar' ? gym.nameAr : gym.nameEn, pin })} />
+        ) : (
+          <button className="btn btn-primary" onClick={create} disabled={busy} aria-busy={busy}>
+            {t('staff.newPin')}
+          </button>
+        )}
+        {err && <Notice tone="danger" icon="alert">{err}</Notice>}
+      </div>
+    </Modal>
   );
 }
 
@@ -158,11 +254,12 @@ function RoleChips({ grantable, value, onChange }: { grantable: string[]; value:
   );
 }
 
-function RolesDialog({ s, grantable, actorRoles, onClose }: { s: StaffAccount; grantable: string[]; actorRoles: string[]; onClose: () => void }) {
+function EditDialog({ s, grantable, actorRoles, onClose }: { s: StaffAccount; grantable: string[]; actorRoles: string[]; onClose: () => void }) {
   const { t, toast } = useApp();
   const actor = useActor();
   const errText = useErrorText();
   const [roles, setRoles] = useState<string[]>(s.roles);
+  const [name, setName] = useState(s.displayName);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const save = async (e: FormEvent) => {
@@ -171,7 +268,7 @@ function RolesDialog({ s, grantable, actorRoles, onClose }: { s: StaffAccount; g
     if (demoMode) return toast(t('app.demoNoSave'));
     setBusy(true);
     try {
-      await data.updateStaffAccount({ ...actor, roles: actorRoles }, s, { roles });
+      await data.updateStaffAccount({ ...actor, roles: actorRoles }, s, { roles, ...(name.trim() !== s.displayName ? { displayName: name } : {}) });
       toast(t('staff.saved'), 'success');
       onClose();
     } catch (ex) {
@@ -181,8 +278,13 @@ function RolesDialog({ s, grantable, actorRoles, onClose }: { s: StaffAccount; g
     }
   };
   return (
-    <Modal open onClose={onClose} title={`${t('staff.editRoles')} — ${s.displayName}`}>
+    <Modal open onClose={onClose} title={`${t('staff.edit')} — ${s.displayName}`}>
       <form className="stack" onSubmit={save} noValidate>
+        <div className="field">
+          <label className="label" htmlFor="en">{t('staff.name')}</label>
+          <input id="en" className="input" value={name} onChange={(e) => setName(e.target.value)} />
+        </div>
+        <span className="label">{t('staff.roles')}</span>
         <RoleChips grantable={grantable} value={roles} onChange={setRoles} />
         {err && <span className="error" role="alert">{err}</span>}
         <button className="btn btn-primary" disabled={busy} aria-busy={busy}>{t('app.save')}</button>
@@ -200,7 +302,8 @@ function InviteStaff({ onClose, grantable, actorRoles, developer, target }: { on
   const [name, setName] = useState(target?.displayName ?? '');
   const [phone, setPhone] = useState(target ? '0' + target.phone.slice(3) : '');
   const [roles, setRoles] = useState<string[]>(target?.roles ?? (developer ? ['admin'] : []));
-  const [url, setUrl] = useState<string | null>(null);
+  const [password, setPassword] = useState<string | null>(null);
+  const [pin, setPin] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -208,11 +311,16 @@ function InviteStaff({ onClose, grantable, actorRoles, developer, target }: { on
     e.preventDefault();
     setErr(null);
     if (roles.length === 0) return setErr(t('staff.pickRole'));
-    if (demoMode) return setUrl('https://pulse-gym.web.app/#/activate?c=…');
+    if (!target && !normalizeEgyptPhone(phone)) return setErr(t('err.invalid-phone'));
+    if (demoMode) {
+      setPin('4826');
+      return setPassword('kxtr5839');
+    }
     setBusy(true);
     try {
-      const r = await data.createStaffInvite({ ...actor, roles: actorRoles }, { phone, displayName: name, roles, purpose: target ? 'reset' : 'activate', target });
-      setUrl(r.url);
+      const r = await data.createStaffLogin({ ...actor, roles: actorRoles }, { phone, displayName: name, roles, target });
+      setPin(r.pin);
+      setPassword(r.password);
     } catch (ex) {
       setErr(errText(ex));
     } finally {
@@ -221,14 +329,18 @@ function InviteStaff({ onClose, grantable, actorRoles, developer, target }: { on
   };
 
   const gymName = lang === 'ar' ? gym.nameAr : gym.nameEn;
-  const text = url ? (target ? t('invite.waReset', { name, gym: gymName, url }) : t('invite.waStaff', { name, gym: gymName, roles: roleLabel(t, roles), url })) : '';
+  const e164 = target?.phone ?? normalizeEgyptPhone(phone) ?? '';
+  // Admins enter with 5 taps on the gym logo, everyone else with 3.
+  const taps = roles.includes('admin') ? 5 : 3;
+  const text = password
+    ? t(target ? 'cred.waStaffReset' : 'cred.waStaff', { name, gym: gymName, roles: roleLabel(t, roles), url: window.location.href.split('#')[0], phone: formatEgyptPhone(e164), password, pin: pin ?? '', taps })
+    : '';
 
   return (
     <Modal open onClose={onClose} title={target ? `${t('staff.reset')} — ${target.displayName}` : developer ? t('staff.inviteAdmin') : t('staff.invite')}>
-      {url ? (
+      {password ? (
         <div className="stack">
-          <Notice icon="check">{t('staff.linkReady')}</Notice>
-          <ShareText text={text} phone={target?.phone ?? ('+20' + phone.replace(/\D/g, '').replace(/^0/, ''))} />
+          <Credentials phone={e164} password={password} pin={pin ?? undefined} text={text} />
         </div>
       ) : (
         <form className="stack" onSubmit={submit} noValidate>

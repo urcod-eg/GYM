@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { aliasId, inviteIdOf, inviteUrl, isInviteCode, isLoginEmail, newInviteCode, newLoginEmail, passwordProblem, rolesInviterMayGrant } from './identity';
+import { aliasId, inviteIdOf, inviteUrl, isInviteCode, isLoginEmail, newInviteCode, newLoginEmail, newPassword, passwordProblem, rolesInviterMayGrant } from './identity';
 import { activeBlocks, liftMemberBlock, memberInvite, redeemInvite, registerMember, SERVER_TIME, setBranding, setLicense, setMemberBlock, staffInvite, updateStaff, WriteError, type InviteDoc } from './writes';
 
 const NOW = new Date('2026-10-14T10:00:00Z');
@@ -36,6 +36,13 @@ describe('identity', () => {
   it('puts the code after the hash route', () => {
     expect(inviteUrl('https://g.web.app/', 'X')).toBe('https://g.web.app/#/activate?c=X');
     expect(inviteUrl('https://g.web.app/#/cashier', 'X')).toBe('https://g.web.app/#/activate?c=X');
+  });
+  it('generated passwords pass the password rule and avoid look-alike characters', () => {
+    for (let i = 0; i < 200; i++) {
+      const pw = newPassword();
+      expect(pw).toMatch(/^[a-hjkmnp-z]{4}[2-9]{4}$/);
+      expect(passwordProblem(pw)).toBeNull();
+    }
   });
   it('password rule', () => {
     expect(passwordProblem('abc12')).toBe('short');

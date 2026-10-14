@@ -48,3 +48,26 @@ export function firebase(): Promise<FB> {
   }
   return ready;
 }
+
+/**
+ * A short-lived second Firebase app with its own in-memory sign-in. Staff use it to create someone
+ * else's account without signing themselves out of the main app. Always call `close()` afterwards.
+ */
+export async function secondaryFirebase(): Promise<{ auth: Auth; db: Firestore; close: () => Promise<void> }> {
+  const [{ app }, appMod, authMod, fsMod] = await Promise.all([firebase(), import('firebase/app'), import('firebase/auth'), import('firebase/firestore')]);
+  const app2 = appMod.initializeApp(app.options, `provision-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const auth = authMod.initializeAuth(app2, { persistence: authMod.inMemoryPersistence });
+  const db = fsMod.getFirestore(app2);
+  if (env.VITE_USE_EMULATORS === '1') {
+    authMod.connectAuthEmulator(auth, 'http://127.0.0.1:9099', { disableWarnings: true });
+    fsMod.connectFirestoreEmulator(db, '127.0.0.1', 8080);
+  }
+  return {
+    auth,
+    db,
+    close: async () => {
+      await authMod.signOut(auth).catch(() => undefined);
+      await appMod.deleteApp(app2).catch(() => undefined);
+    },
+  };
+}

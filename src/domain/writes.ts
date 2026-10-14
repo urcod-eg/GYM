@@ -19,6 +19,8 @@ export type ServerTime = typeof SERVER_TIME;
 export type Value = string | number | boolean | null | Date | ServerTime | Value[] | { [k: string]: Value };
 export type DocData = { [k: string]: Value };
 export type WriteOp = { type: 'set' | 'update'; path: string; data: DocData };
+export type DeleteOp = { type: 'delete'; path: string };
+export type AnyOp = WriteOp | DeleteOp;
 
 /** A refusal the UI can translate (`err.<reason>` in the string tables). */
 export class WriteError extends Error {
@@ -39,7 +41,7 @@ export type BlockScope = (typeof BLOCK_SCOPES)[number];
 export const LICENSE_TYPES = ['TRIAL', 'FIXED', 'LIFETIME'] as const;
 export type LicenseType = (typeof LICENSE_TYPES)[number];
 
-function audit(auditId: string, actorUid: string, action: string, entityType: 'members' | 'users' | 'license' | 'gymPublicConfig', entityId: string, summary: DocData): WriteOp {
+function audit(auditId: string, actorUid: string, action: string, entityType: 'members' | 'users' | 'license' | 'gymPublicConfig' | 'pinSecrets', entityId: string, summary: DocData): WriteOp {
   return { type: 'set', path: `auditLogs/${auditId}`, data: { actorUid, action, entityType, entityId, at: SERVER_TIME, summary } };
 }
 
@@ -271,18 +273,25 @@ export function redeemInvite(i: { uid: string; email: string; inviteId: string; 
 
 // ---------------------------------------------------------------- staff
 
-export function updateStaff(i: {
-  actorUid: string;
-  actorRoles: readonly string[];
-  auditId: string;
-  target: { uid: string; roles: string[]; status: string; kind: string };
-  roles?: string[];
-  status?: 'active' | 'disabled';
-}): WriteOp[] {
-  if (i.target.uid === i.actorUid) refuse('cannot-change-self');
-  if (i.target.kind !== 'staff' || i.target.status === 'replaced') refuse('not-found');
-  const allowed = rolesInviterMayGrant(i.actorRoles);
-  if (!i.target.roles.every((r) => allowed.includes(r as StaffRole))) refuse('permission-denied');
+export interface StaffTarget {
+  uid: string;
+  roles: string[];
+  status: string;
+  kind: string;
+  phone?: string;
+}
+
+/** Who may manage this staff account: never yourself; admins only non-admins; the developer anyone. */
+function assertManageable(actorUid: string, actorRoles: readonly string[], t: StaffTarget) {
+  if (t.uid === actorUid) refuse('cannot-change-self');
+  if (t.kind !== 'staff' || t.status === 'replaced' || t.status === 'removed') refuse('not-found');
+  const allowed = rolesInviterMayGrant(actorRoles);
+  if (!t.roles.every((r) => allowed.includes(r as StaffRole))) refuse('permission-denied');
+  return allowed;
+}
+
+export function updateStaff(i: { actorUid: string; actorRoles: readonly string[]; auditId: string; target: StaffTarget; roles?: string[]; status?: 'active' | 'disabled'; displayName?: string }): WriteOp[] {
+  const allowed = assertManageable(i.actorUid, i.actorRoles, i.target);
   const data: DocData = { updatedAt: SERVER_TIME, lastAuditId: i.auditId };
   const summary: DocData = {};
   if (i.roles) {
@@ -295,8 +304,90 @@ export function updateStaff(i: {
     data.status = i.status;
     summary.status = i.status;
   }
-  if (!i.roles && !i.status) refuse('invalid-input');
+  if (i.displayName !== undefined) {
+    const name = cleanName(i.displayName);
+    if (name.length < 2 || name.length > 80) refuse('invalid-name');
+    data.displayName = name;
+    summary.displayName = name;
+  }
+  if (!i.roles && !i.status && i.displayName === undefined) refuse('invalid-input');
   return [{ type: 'update', path: `users/${i.target.uid}`, data }, audit(i.auditId, i.actorUid, 'staff.update', 'users', i.target.uid, summary)];
+}
+
+/** Removes a staff account for good: no sign-in, the phone number becomes free, any open session ends. */
+export function removeStaff(i: { actorUid: string; actorRoles: readonly string[]; auditId: string; target: StaffTarget & { phone: string } }): AnyOp[] {
+  assertManageable(i.actorUid, i.actorRoles, i.target);
+  return [
+    { type: 'update', path: `users/${i.target.uid}`, data: { status: 'removed', updatedAt: SERVER_TIME, lastAuditId: i.auditId } },
+    audit(i.auditId, i.actorUid, 'staff.remove', 'users', i.target.uid, { phone: i.target.phone }),
+    { type: 'delete', path: `loginAliases/${aliasId('staff', i.target.phone)}` },
+    { type: 'delete', path: `staffSessions/${i.target.uid}` },
+  ];
+}
+
+// ---------------------------------------------------------------- staff sign-in code (4-digit PIN)
+
+export const PIN_MAX_TRIES = 5;
+export const isPin = (pin: string) => /^[0-9]{4}$/.test(pin);
+export const PHRASE_MIN = 10;
+export const PHRASE_MAX = 128;
+/** The developer's second step is the 4-digit code plus a security phrase, checked as one value. */
+export const devSecretValue = (pin: string, phrase: string) => `${pin}:${phrase}`;
+export const isDevSecretValue = (v: string) => /^[0-9]{4}:.{10,128}$/su.test(v) && v.length <= 140;
+
+/**
+ * Sets a staff member's 4-digit sign-in code. Only `salt` and `hash` = SHA-256(salt + pin) are stored,
+ * in a document no browser can read; the rules recompute the hash when the code is entered.
+ */
+export function setStaffPin(i: { actorUid: string; actorRoles: readonly string[]; auditId: string; target: StaffTarget; salt: string; hash: string }): AnyOp[] {
+  assertManageable(i.actorUid, i.actorRoles, i.target);
+  if (!/^[0-9a-f]{32}$/.test(i.salt) || !/^[0-9a-f]{64}$/.test(i.hash)) refuse('invalid-input');
+  return [
+    { type: 'set', path: `pinSecrets/${i.target.uid}`, data: { salt: i.salt, hash: i.hash, setBy: i.actorUid, setAt: SERVER_TIME, lastAuditId: i.auditId } },
+    audit(i.auditId, i.actorUid, 'staff.pin', 'pinSecrets', i.target.uid, {}),
+    // A new code also clears a lockout and ends any open session.
+    { type: 'set', path: `pinTries/${i.target.uid}`, data: { pin: null, count: 0, authTime: 0, at: SERVER_TIME } },
+    { type: 'delete', path: `staffSessions/${i.target.uid}` },
+  ];
+}
+
+/** Step 1 of entering the code: record the attempt (counted, at most PIN_MAX_TRIES in a row). */
+export function pinAttempt(i: { uid: string; pin: string; authTime: number; prevCount: number }): WriteOp[] {
+  if (!isPin(i.pin) && !isDevSecretValue(i.pin)) refuse('invalid-pin');
+  if (i.prevCount >= PIN_MAX_TRIES) refuse('pin-locked');
+  return [{ type: 'set', path: `pinTries/${i.uid}`, data: { pin: i.pin, count: i.prevCount + 1, authTime: i.authTime, at: SERVER_TIME } }];
+}
+
+/**
+ * The developer sets (or, from an open session, changes) their own code + security phrase.
+ * `hash` = SHA-256(salt + devSecretValue(pin, phrase)).
+ */
+export function setDevSecret(i: { uid: string; auditId: string; salt: string; hash: string }): WriteOp[] {
+  if (!/^[0-9a-f]{32}$/.test(i.salt) || !/^[0-9a-f]{64}$/.test(i.hash)) refuse('invalid-input');
+  return [
+    { type: 'set', path: `pinSecrets/${i.uid}`, data: { salt: i.salt, hash: i.hash, setBy: i.uid, setAt: SERVER_TIME, lastAuditId: i.auditId } },
+    audit(i.auditId, i.uid, 'dev.secret', 'pinSecrets', i.uid, {}),
+    { type: 'set', path: `devSetup/${i.uid}`, data: { at: SERVER_TIME } },
+  ];
+}
+
+/** Step 2: open the session for this sign-in. The rules accept it only if the recorded attempt matches the hash. */
+export function openStaffSession(i: { uid: string; authTime: number; device: string }): WriteOp[] {
+  return [
+    { type: 'set', path: `staffSessions/${i.uid}`, data: { authTime: i.authTime, device: i.device.slice(0, 120), at: SERVER_TIME } },
+    { type: 'set', path: `pinTries/${i.uid}`, data: { pin: null, count: 0, authTime: i.authTime, at: SERVER_TIME } },
+  ];
+}
+
+/** Ends a staff session (the person signs out, or an admin ends it remotely). */
+export function endStaffSession(uid: string): AnyOp[] {
+  return [{ type: 'delete', path: `staffSessions/${uid}` }];
+}
+
+/** Admin: clears a lockout after too many wrong codes, without changing the code. */
+export function unlockPin(i: { actorUid: string; actorRoles: readonly string[]; target: StaffTarget }): WriteOp[] {
+  assertManageable(i.actorUid, i.actorRoles, i.target);
+  return [{ type: 'set', path: `pinTries/${i.target.uid}`, data: { pin: null, count: 0, authTime: 0, at: SERVER_TIME } }];
 }
 
 // ---------------------------------------------------------------- developer

@@ -11,6 +11,8 @@ export interface AuthSpec {
   email?: string;
   /** Signed in with a second factor (TOTP). */
   mfa?: boolean;
+  /** Seconds since epoch of the sign-in (the ID token's auth_time claim). */
+  authTime?: number;
 }
 
 export type SimOp = WriteOp | { type: 'delete'; path: string };
@@ -69,7 +71,7 @@ export class SimFirestore {
     if (!auth) return null;
     const firebase: Record<string, RV> = { sign_in_provider: 'password' };
     if (auth.mfa) firebase.sign_in_second_factor = 'totp';
-    const token: Record<string, RV> = { firebase: RMap.of(firebase) };
+    const token: Record<string, RV> = { firebase: RMap.of(firebase), auth_time: auth.authTime ?? 1_700_000_000 };
     if (auth.email) token.email = auth.email;
     return RMap.of({ uid: auth.uid, token: RMap.of(token) });
   }

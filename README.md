@@ -66,7 +66,7 @@ src/domain/writes.ts     every write set (register member, invites, redeem, bloc
 src/firebase/commit.ts   write sets → atomic Firestore batches/transactions (shared with the rules tests)
 src/firebase/data.ts     sign-in, invites, live lists, licence, branding
 firestore.rules          roles from users/{uid}; audit entry required with every sensitive change;
-                         licence needed for staff writes; second factor needed for developer writes
+                         licence needed for staff writes; staff and developer need a per-sign-in session opened with their code (developer: code + security phrase)
 tests/rules/scenarios.ts security scenarios, written once and run on:
   tests/rules-sim/       an in-repo rules simulator (Firebase's own ANTLR grammar) — part of `npm test`
   tests/rules/           the official Firestore emulator — `npm run test:rules` (Java 21, also in CI)
@@ -79,16 +79,26 @@ tests/rules/scenarios.ts security scenarios, written once and run on:
 | `npm run typecheck` | app and tests |
 | `npm run lint:rules` | syntax check of firestore.rules with the official grammar |
 | `npm run test:rules` | rules scenarios on the official emulator (Java 21) |
-| `npm run deploy` | build + `firebase deploy --only firestore,hosting` |
+| `npm run deploy` | `firebase deploy --only firestore` (rules + indexes). The app itself is published to GitHub Pages by `.github/workflows/pages.yml` on every push to `main`. |
 
 How sign-in works: everyone except the developer signs in with an Egyptian mobile number and a
 password. Firebase Auth only knows e-mail accounts, so each person gets a random internal address on
 the reserved `.invalid` domain (it can never receive mail). `loginAliases/{m|s}+20…` maps the phone to
-that address and can only be written while redeeming an invite. Invites are 256-bit codes sent on
-WhatsApp; Firestore stores only their SHA-256. Redeeming creates the person's own account and, in one
-atomic batch, marks the invite used, creates `users/{uid}` with exactly the invited roles, points the
-phone at the new account and (for resets) retires the old one. Nobody ever sees another person's
-password, and there is no self-service reset: recovery is a new link from management.
+that address. When front-desk staff create an account, the app generates the password (4 letters +
+4 digits) and prepares a WhatsApp message with the phone number and password; the staff member presses
+Send. Internally this is an invite + immediate redemption: the invite is written as the staff member,
+then a short-lived in-memory second Firebase app creates the new account and, in one atomic batch,
+marks the invite used, creates `users/{uid}` with exactly the invited roles, points the phone at the new
+account and (for resets) retires the old one. The rules check every step. The sender sees the
+password — the accepted price of this simpler flow; every account creation and reset keeps who did it (`invites/{id}.createdBy`).
+
+Staff sign-in has a second factor: a 4-digit code stored only as `pinSecrets/{uid}` =
+{salt, SHA-256(salt + code)}, which no client can read. Entering the code writes a counted attempt
+(`pinTries`, max 5 in a row) and then opens `staffSessions/{uid}` bound to the sign-in's `auth_time`;
+the rules recompute the hash with `hashing.sha256`. Every staff role check requires that session, so a
+leaked password alone grants nothing. Admins can end sessions, unlock, issue new codes, edit, disable or
+remove staff (never other admins or themselves). "Remember me" switches Firebase Auth persistence
+between local and session.
 
 Known trade-off: a single `loginAliases` document is readable by id, so someone who already knows a
 phone number can tell whether it is registered at this gym (lists are refused).

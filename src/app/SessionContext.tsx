@@ -3,7 +3,8 @@ import type { User } from 'firebase/auth';
 import { Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { useApp } from './AppContext';
 import { demoMode, firebase } from '../firebase/client';
-import { watchOwnMember, watchProfile, type MemberDoc, type UserProfile } from '../firebase/data';
+import { endOwnStaffSession, watchOwnMember, watchOwnStaffSession, watchProfile, type MemberDoc, type UserProfile } from '../firebase/data';
+import { PinGate } from '../components/PinGate';
 import { activeBlocks } from '../domain/writes';
 
 /**
@@ -22,13 +23,15 @@ export interface Session {
   blocks: string[];
   /** This sign-in used a second factor (needed for developer writes). */
   mfa: boolean;
+  /** Staff only: the 4-digit code was entered for this sign-in (an open session matching auth_time). */
+  staffReady: boolean;
   signOut: () => Promise<void>;
 }
 
 const Ctx = createContext<Session | null>(null);
 
 type State = Omit<Session, 'signOut'>;
-const EMPTY: State = { loading: false, user: null, profile: null, roles: [], memberId: null, member: null, blocks: [], mfa: false };
+const EMPTY: State = { loading: false, user: null, profile: null, roles: [], memberId: null, member: null, blocks: [], mfa: false, staffReady: false };
 
 export function SessionProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<State>({ ...EMPTY, loading: !demoMode });
@@ -38,11 +41,13 @@ export function SessionProvider({ children }: { children: ReactNode }) {
     let stopAuth: (() => void) | undefined;
     let stopProfile: (() => void) | undefined;
     let stopMember: (() => void) | undefined;
+    let stopStaff: (() => void) | undefined;
     let cancelled = false;
     const clear = () => {
       stopProfile?.();
       stopMember?.();
-      stopProfile = stopMember = undefined;
+      stopStaff?.();
+      stopProfile = stopMember = stopStaff = undefined;
     };
     Promise.all([firebase(), import('firebase/auth')]).then(([{ auth }, A]) => {
       if (cancelled) return;
@@ -51,14 +56,23 @@ export function SessionProvider({ children }: { children: ReactNode }) {
         if (!user) return setState(EMPTY);
         setState((s) => ({ ...s, loading: true, user }));
         // True only when this sign-in itself used the second factor (what the rules check).
-        const mfa = !!(await user.getIdTokenResult()).signInSecondFactor;
+        const token = await user.getIdTokenResult();
+        const mfa = !!token.signInSecondFactor;
+        const authTime = Number(token.claims.auth_time ?? 0);
         const unsub = await watchProfile(user.uid, (profile) => {
           stopMember?.();
           stopMember = undefined;
           const ok = profile?.status === 'active';
           const roles = ok ? profile!.roles : [];
           const memberId = ok && profile!.kind === 'member' ? profile!.memberId : null;
-          setState({ loading: !!memberId, user, profile, roles, memberId, member: null, blocks: [], mfa });
+          // Staff and the developer both need the second step (code, or code + phrase) per sign-in.
+          const staff = ok && (profile!.kind === 'staff' || profile!.kind === 'developer');
+          setState((s) => ({ loading: !!memberId || (staff && !stopStaff), user, profile, roles, memberId, member: null, blocks: [], mfa, staffReady: staff ? s.staffReady : false }));
+          if (staff && !stopStaff) {
+            watchOwnStaffSession(user.uid, (sessionAuthTime) => {
+              setState((s) => ({ ...s, loading: false, staffReady: sessionAuthTime !== null && sessionAuthTime === authTime }));
+            }).then((u) => (stopStaff = u));
+          }
           if (memberId) {
             watchOwnMember(memberId, (member, blocked) => {
               setState((s) => ({ ...s, loading: false, member, blocks: blocked ? ['LOGIN_BLOCK'] : activeBlocks(member?.blocks, new Date()) }));
@@ -82,6 +96,7 @@ export function SessionProvider({ children }: { children: ReactNode }) {
       signOut: async () => {
         if (demoMode) return;
         const [{ auth }, { signOut }] = await Promise.all([firebase(), import('firebase/auth')]);
+        if ((state.profile?.kind === 'staff' || state.profile?.kind === 'developer') && auth.currentUser) await endOwnStaffSession(auth.currentUser.uid);
         await signOut(auth);
       },
     }),
@@ -121,6 +136,7 @@ export function RequireRole({ any, children }: { any: string[]; children: ReactN
   if (s.loading) return <div className="main" aria-busy="true" />;
   if (!s.user) return <Navigate to="/" replace state={{ from: loc.pathname }} />;
   if (!s.roles.some((r) => any.includes(r))) return <Navigate to={s.roles.length ? homeFor(s.roles) : '/'} replace />;
+  if ((s.profile?.kind === 'staff' || s.profile?.kind === 'developer') && !s.staffReady) return <PinGate />;
   if (s.roles.includes('member') && any.includes('member') && s.blocks.some((b) => b === 'LOGIN_BLOCK' || b === 'TEMPORARY_SUSPENSION')) return <BlockedScreen />;
   return <>{children}</>;
 }

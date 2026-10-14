@@ -78,3 +78,30 @@ export function rolesInviterMayGrant(inviterRoles: readonly string[]): StaffRole
   if (inviterRoles.includes('admin')) return ['accountant', 'cashier', 'coach'];
   return [];
 }
+
+/**
+ * A password the app generates for a new account: 4 letters + 4 digits, without look-alike
+ * characters (no i, l, o, 0, 1), easy to read on WhatsApp and to type on a phone.
+ */
+export function newPassword(): string {
+  const letters = 'abcdefghjkmnpqrstuvwxyz';
+  const digits = '23456789';
+  const pick = (set: string, n: number) => Array.from(randomBytes(n), (b) => set[b % set.length]).join('');
+  return pick(letters, 4) + pick(digits, 4);
+}
+
+/** A 4-digit staff sign-in code. */
+export function newPin(): string {
+  return Array.from(randomBytes(4), (b) => String(b % 10)).join('');
+}
+
+/** A random 16-byte salt as 32 hex characters. */
+export function newSalt(): string {
+  return hex(randomBytes(16));
+}
+
+/** SHA-256(salt + pin) in lowercase hex — the same value the security rules compute. */
+export async function hashPin(salt: string, pin: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(salt + pin));
+  return hex(new Uint8Array(digest));
+}
