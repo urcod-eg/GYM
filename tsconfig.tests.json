@@ -1,0 +1,6 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "types": ["vite/client", "node"], "noUnusedLocals": false, "noUnusedParameters": false, "customConditions": ["node"] },
+  "include": ["src", "tests"],
+  "exclude": ["tests/rules-sim/grammar"]
+}

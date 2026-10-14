@@ -1,0 +1,363 @@
+rules_version = '2';
+
+// Gym PWA — Firestore security rules (Phase 2, free Spark plan).
+//
+// There is no server code on the free plan, so these rules are the only guard. Every write the app
+// makes is built by src/domain/writes.ts; tests/rules commits those exact write sets against the
+// emulator. Principles:
+//   * Roles come from users/{uid}, which only an invite redemption can create and only an admin or
+//     the developer can change. Nothing a browser sends can grant a role.
+//   * Every sensitive change carries a fresh audit entry in the same atomic write
+//     (lastAuditId on the changed document ⇄ auditLogs/{id} pointing back at it).
+//   * Staff writes need a valid licence. Developer writes need a second factor (TOTP).
+//   * Anything not listed is denied.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------------------------------------------------------------- paths
+    function userPath(u)    { return /databases/$(database)/documents/users/$(u); }
+    function memberPath(m)  { return /databases/$(database)/documents/members/$(m); }
+    function invitePath(h)  { return /databases/$(database)/documents/invites/$(h); }
+    function aliasPath(a)   { return /databases/$(database)/documents/loginAliases/$(a); }
+    function phonePath(p)   { return /databases/$(database)/documents/phoneIndex/$(p); }
+    function auditPath(a)   { return /databases/$(database)/documents/auditLogs/$(a); }
+    function licensePath()  { return /databases/$(database)/documents/license/main; }
+    function configPath()   { return /databases/$(database)/documents/gymPublicConfig/main; }
+    function counterPath()  { return /databases/$(database)/documents/counters/members; }
+
+    // ---------------------------------------------------------------- who is asking
+    function signedIn() { return request.auth != null; }
+    function me() { return get(userPath(request.auth.uid)).data; }
+    function active() { return signedIn() && exists(userPath(request.auth.uid)) && me().status == 'active'; }
+    function hasRole(r) { return active() && r in me().roles; }
+    function isDev() { return hasRole('developer'); }
+    function isAdmin() { return hasRole('admin') || isDev(); }
+    function isAccountant() { return hasRole('accountant'); }
+    function isCashier() { return hasRole('cashier'); }
+    function isCoach() { return hasRole('coach'); }
+    function isStaff() { return active() && me().kind in ['staff', 'developer']; }
+    function isFrontDesk() { return isAdmin() || isAccountant() || isCashier(); }
+
+    // Developer writes need a second factor in this sign-in session.
+    function devMfa() { return isDev() && request.auth.token.firebase.get('sign_in_second_factor', null) != null; }
+
+    function licensed() {
+      return exists(licensePath())
+        && get(licensePath()).data.state == 'ACTIVE'
+        && (get(licensePath()).data.endsAt == null || request.time < get(licensePath()).data.endsAt);
+    }
+    function adminWriter() { return (hasRole('admin') && licensed()) || devMfa(); }
+    function frontDeskWriter() { return ((hasRole('admin') || hasRole('cashier')) && licensed()) || devMfa(); }
+
+    // A block counts until its `until` time (null = until lifted).
+    function blockedNow(b, scope) { return scope in b && (b[scope].get('until', null) == null || b[scope].until > request.time); }
+    function memberMayUseApp(m) {
+      let b = get(memberPath(m)).data.blocks;
+      return !blockedNow(b, 'LOGIN_BLOCK') && !blockedNow(b, 'TEMPORARY_SUSPENSION');
+    }
+    function isMemberSelf(m) { return active() && me().kind == 'member' && me().memberId == m && memberMayUseApp(m); }
+    function ownsMemberDoc() { return isMemberSelf(resource.data.memberId); }
+
+    function onlyChanges(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
+    function exactKeys(keys) { return request.resource.data.keys().hasOnly(keys) && request.resource.data.keys().hasAll(keys); }
+
+    function validPhone(p) { return p is string && p.matches('^[+]20(10|11|12|15)[0-9]{8}$'); }
+    function validLoginEmail(e) { return e is string && e.matches('^[ms]-[0-9a-f]{24}@login[.]urcod[.]invalid$'); }
+
+    // The write must create a new audit entry describing exactly this change.
+    function freshAudit(action, type, id) {
+      let a = request.resource.data.lastAuditId;
+      return a is string
+        && !exists(auditPath(a))
+        && getAfter(auditPath(a)).data.action == action
+        && getAfter(auditPath(a)).data.entityType == type
+        && getAfter(auditPath(a)).data.entityId == id;
+    }
+
+    // An invite redeemed in this very request by the signed-in (brand new) account.
+    function redeemedNow(inv) { return inv.usedBy == request.auth.uid && inv.usedAt == request.time; }
+
+    // ---------------------------------------------------------------- default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ---------------------------------------------------------------- public gym identity
+    match /gymPublicConfig/{id} {
+      allow read: if true;
+      allow create, update: if id == 'main' && devMfa() && brandingShape() && freshAudit('branding.set', 'gymPublicConfig', 'main');
+    }
+    function brandingShape() {
+      let d = request.resource.data;
+      return exactKeys(['nameAr', 'nameEn', 'codePrefix', 'primaryColor', 'supportPhone', 'logoDataUrl', 'updatedAt', 'updatedBy', 'lastAuditId'])
+        && d.nameAr is string && d.nameAr.size() >= 2 && d.nameAr.size() <= 60
+        && d.nameEn is string && d.nameEn.size() >= 2 && d.nameEn.size() <= 60
+        && d.codePrefix is string && d.codePrefix.matches('^[A-Z]{2,5}$')
+        && d.primaryColor is string && d.primaryColor.matches('^#[0-9A-F]{6}$')
+        && validPhone(d.supportPhone)
+        && (d.logoDataUrl == null
+            || (d.logoDataUrl is string && d.logoDataUrl.size() <= 200000
+                && d.logoDataUrl.matches('^data:image/(png|webp|jpeg);base64,[A-Za-z0-9+/=]+$')))
+        && d.updatedBy == request.auth.uid
+        && d.updatedAt == request.time;
+    }
+
+    // ---------------------------------------------------------------- licence
+    match /license/{id} {
+      allow get: if active();
+      allow create, update: if id == 'main' && devMfa() && licenseShape() && freshAudit('license.set', 'license', 'main');
+    }
+    function licenseShape() {
+      let d = request.resource.data;
+      return exactKeys(['type', 'state', 'startsAt', 'endsAt', 'version', 'note', 'updatedAt', 'updatedBy', 'lastAuditId'])
+        && d.type in ['TRIAL', 'FIXED', 'LIFETIME']
+        && d.state in ['ACTIVE', 'SUSPENDED']
+        && d.startsAt is timestamp
+        && ((d.type == 'LIFETIME' && d.endsAt == null)
+            || (d.type != 'LIFETIME' && d.endsAt is timestamp && d.endsAt > d.startsAt
+                && d.endsAt <= d.startsAt + duration.value(3650, 'd')
+                && (d.type != 'TRIAL' || d.endsAt <= d.startsAt + duration.value(60, 'd'))))
+        && ((resource == null && d.version == 1) || (resource != null && d.version == resource.data.version + 1))
+        && d.note is string && d.note.size() <= 200
+        && d.updatedBy == request.auth.uid
+        && d.updatedAt == request.time;
+    }
+
+    // ---------------------------------------------------------------- sign-in aliases (phone → internal e-mail)
+    // Readable by id only (the sign-in screen looks up one phone). Written only while redeeming an invite.
+    match /loginAliases/{a} {
+      allow get: if true;
+      allow create: if aliasWrite(a) && getAfter(invitePath(request.resource.data.inviteId)).data.prevUid == null;
+      allow update: if aliasWrite(a) && getAfter(invitePath(request.resource.data.inviteId)).data.prevUid == resource.data.uid;
+    }
+    function aliasWrite(a) {
+      let d = request.resource.data;
+      let inv = getAfter(invitePath(d.inviteId)).data;
+      return signedIn()
+        && exactKeys(['email', 'uid', 'inviteId', 'at'])
+        && d.uid == request.auth.uid
+        && d.email == request.auth.token.email
+        && validLoginEmail(d.email)
+        && d.at == request.time
+        && redeemedNow(inv)
+        && inv.aliasId == a;
+    }
+
+    // ---------------------------------------------------------------- invites (activation / password reset links)
+    // The id is the SHA-256 of a 256-bit code that only the link holder knows, so `get` is open and
+    // `list` is not.
+    match /invites/{h} {
+      allow get: if true;
+      allow list: if isAdmin();
+      allow create: if h.matches('^[0-9a-f]{64}$') && inviteShape()
+        && ((request.resource.data.kind == 'member' && memberInviteOk())
+            || (request.resource.data.kind == 'staff' && staffInviteOk()));
+      allow update: if redeeming(h);
+      allow delete: if resource.data.usedAt == null
+        && (adminWriter() || (frontDeskWriter() && resource.data.createdBy == request.auth.uid));
+    }
+    function inviteShape() {
+      let d = request.resource.data;
+      return exactKeys(['kind', 'purpose', 'aliasId', 'phone', 'displayName', 'roles', 'memberId', 'prevUid', 'identityCheck', 'createdBy', 'createdAt', 'expiresAt', 'usedAt', 'usedBy'])
+        && d.purpose in ['activate', 'reset']
+        && validPhone(d.phone)
+        && d.displayName is string && d.displayName.size() >= 2 && d.displayName.size() <= 80
+        && d.roles is list && d.roles.size() > 0
+        && d.createdBy == request.auth.uid
+        && d.createdAt == request.time
+        && d.expiresAt is timestamp && d.expiresAt > request.time && d.expiresAt < request.time + duration.value(48, 'h')
+        && d.usedAt == null && d.usedBy == null;
+    }
+    function memberInviteOk() {
+      let d = request.resource.data;
+      let m = get(memberPath(d.memberId)).data;
+      return d.roles == ['member']
+        && d.aliasId == 'm' + d.phone
+        && m.phoneE164 == d.phone
+        && m.fullName == d.displayName
+        && ((d.purpose == 'activate' && frontDeskWriter() && m.authUid == null && d.prevUid == null && d.identityCheck == null)
+            || (d.purpose == 'reset' && adminWriter() && m.authUid != null && d.prevUid == m.authUid
+                && d.identityCheck in ['IN_PERSON', 'PHONE_CALL']));
+    }
+    function staffInviteOk() {
+      let d = request.resource.data;
+      return d.memberId == null && d.identityCheck == null
+        && d.aliasId == 's' + d.phone
+        && ((devMfa() && d.roles.hasOnly(['admin', 'accountant', 'cashier', 'coach']))
+            || (hasRole('admin') && licensed() && d.roles.hasOnly(['accountant', 'cashier', 'coach'])))
+        && ((d.purpose == 'activate' && d.prevUid == null && !exists(aliasPath(d.aliasId)))
+            || (d.purpose == 'reset' && d.prevUid is string && staffResetTarget(d)));
+    }
+    function staffResetTarget(d) {
+      let t = get(userPath(d.prevUid)).data;
+      return get(aliasPath(d.aliasId)).data.uid == d.prevUid
+        && t.kind == 'staff' && t.status == 'active' && t.roles == d.roles;
+    }
+    function redeeming(h) {
+      return signedIn()
+        && resource.data.usedAt == null && resource.data.usedBy == null
+        && resource.data.expiresAt > request.time
+        && onlyChanges(['usedAt', 'usedBy'])
+        && request.resource.data.usedAt == request.time
+        && request.resource.data.usedBy == request.auth.uid
+        && getAfter(userPath(request.auth.uid)).data.inviteId == h;
+    }
+
+    // ---------------------------------------------------------------- people
+    match /users/{u} {
+      allow get: if signedIn() && (request.auth.uid == u || isAdmin());
+      allow list: if isAdmin();
+      allow create: if signedIn() && request.auth.uid == u && redeemedProfile(u);
+      allow update: if retiredByReset(u) || staffEdit(u);
+    }
+    function redeemedProfile(u) {
+      let d = request.resource.data;
+      let inv = getAfter(invitePath(d.inviteId)).data;
+      return exactKeys(['kind', 'roles', 'status', 'displayName', 'phone', 'memberId', 'inviteId', 'createdAt'])
+        && redeemedNow(inv)
+        && d.kind == inv.kind && d.roles == inv.roles
+        && d.displayName == inv.displayName && d.phone == inv.phone && d.memberId == inv.memberId
+        && d.status == 'active'
+        && d.createdAt == request.time
+        && getAfter(aliasPath(inv.aliasId)).data.uid == u
+        && (inv.kind != 'member' || getAfter(memberPath(inv.memberId)).data.authUid == u)
+        && (inv.prevUid == null || getAfter(userPath(inv.prevUid)).data.status == 'replaced');
+    }
+    // A reset retires the old account in the same batch that creates the new one.
+    function retiredByReset(u) {
+      let d = request.resource.data;
+      let inv = getAfter(invitePath(getAfter(userPath(request.auth.uid)).data.inviteId)).data;
+      return signedIn() && u != request.auth.uid
+        && resource.data.status == 'active'
+        && onlyChanges(['status', 'replacedBy', 'updatedAt'])
+        && d.status == 'replaced' && d.replacedBy == request.auth.uid && d.updatedAt == request.time
+        && redeemedNow(inv) && inv.prevUid == u;
+    }
+    function staffEdit(u) {
+      let t = resource.data;
+      let d = request.resource.data;
+      return signedIn() && u != request.auth.uid
+        && t.kind == 'staff' && t.status in ['active', 'disabled']
+        && onlyChanges(['roles', 'status', 'updatedAt', 'lastAuditId'])
+        && d.status in ['active', 'disabled']
+        && d.roles is list && d.roles.size() > 0
+        && d.updatedAt == request.time
+        && ((devMfa() && d.roles.hasOnly(['admin', 'accountant', 'cashier', 'coach']))
+            || (hasRole('admin') && licensed() && !('admin' in t.roles) && d.roles.hasOnly(['accountant', 'cashier', 'coach'])))
+        && freshAudit('staff.update', 'users', u);
+    }
+
+    match /members/{m} {
+      allow get: if isMemberSelf(m) || isFrontDesk() || (isCoach() && resource.data.assignedCoachId == request.auth.uid);
+      allow list: if isFrontDesk() || (isCoach() && resource.data.assignedCoachId == request.auth.uid);
+      allow create: if frontDeskWriter() && newMember(m);
+      allow update: if memberLinkedByInvite(m) || memberBlocks(m);
+    }
+    function newMember(m) {
+      let d = request.resource.data;
+      let no = d.memberNo;
+      return exactKeys(['memberNo', 'memberCode', 'fullName', 'phoneE164', 'authUid', 'accountStatus', 'assignedCoachId', 'vipTierId', 'blocks', 'searchTokens', 'lastInviteId', 'createdAt', 'createdBy', 'updatedAt', 'lastAuditId'])
+        && no is int
+        && ((exists(counterPath()) && get(counterPath()).data.next == no) || (!exists(counterPath()) && no == 10001))
+        && getAfter(counterPath()).data.next == no + 1
+        && getAfter(counterPath()).data.lastMemberId == m
+        && ((exists(configPath()) && d.memberCode == get(configPath()).data.codePrefix + '-' + string(no))
+            || (!exists(configPath()) && d.memberCode == 'GYM-' + string(no)))
+        && d.fullName is string && d.fullName.size() >= 2 && d.fullName.size() <= 80
+        && validPhone(d.phoneE164)
+        && getAfter(phonePath(d.phoneE164)).data.memberId == m
+        && d.authUid == null && d.accountStatus == 'PENDING_ACTIVATION'
+        && (d.assignedCoachId == null || d.assignedCoachId is string)
+        && d.vipTierId == null
+        && d.blocks is map && d.blocks.size() == 0
+        && d.searchTokens is list && d.searchTokens.size() <= 80
+        && d.lastInviteId == null
+        && d.createdBy == request.auth.uid
+        && d.createdAt == request.time && d.updatedAt == request.time
+        && freshAudit('member.register', 'members', m);
+    }
+    function memberLinkedByInvite(m) {
+      let d = request.resource.data;
+      let inv = getAfter(invitePath(d.lastInviteId)).data;
+      return signedIn()
+        && onlyChanges(['authUid', 'accountStatus', 'lastInviteId', 'updatedAt'])
+        && d.authUid == request.auth.uid && d.accountStatus == 'ACTIVE' && d.updatedAt == request.time
+        && redeemedNow(inv)
+        && inv.kind == 'member' && inv.memberId == m
+        && resource.data.authUid == inv.prevUid;
+    }
+    function memberBlocks(m) {
+      let d = request.resource.data;
+      return adminWriter()
+        && onlyChanges(['blocks', 'updatedAt', 'lastAuditId'])
+        && d.blocks is map
+        && d.blocks.keys().hasOnly(['LOGIN_BLOCK', 'TEMPORARY_SUSPENSION', 'CHECKIN_BLOCK', 'PAID_FEATURES_BLOCK'])
+        && d.updatedAt == request.time
+        && (freshAudit('member.block', 'members', m) || freshAudit('member.unblock', 'members', m));
+    }
+
+    // Phone numbers are unique per gym: the index entry is created with the member and never changes.
+    match /phoneIndex/{p} {
+      allow get: if isFrontDesk();
+      allow create: if frontDeskWriter()
+        && exactKeys(['memberId', 'createdAt'])
+        && request.resource.data.createdAt == request.time
+        && !exists(memberPath(request.resource.data.memberId))
+        && getAfter(memberPath(request.resource.data.memberId)).data.phoneE164 == p;
+    }
+
+    // Member numbers: each registration moves the counter by exactly one, in the same transaction.
+    match /counters/{c} {
+      allow get: if isFrontDesk();
+      allow create: if c == 'members' && frontDeskWriter() && counterBump(10001);
+      allow update: if c == 'members' && frontDeskWriter() && counterBump(resource.data.next);
+    }
+    function counterBump(no) {
+      let d = request.resource.data;
+      return exactKeys(['next', 'lastMemberId', 'updatedAt'])
+        && d.next == no + 1
+        && d.updatedAt == request.time
+        && !exists(memberPath(d.lastMemberId))
+        && getAfter(memberPath(d.lastMemberId)).data.memberNo == no;
+    }
+
+    // ---------------------------------------------------------------- audit log (append-only)
+    match /auditLogs/{aid} {
+      allow get, list: if isAdmin();
+      allow create: if active() && auditShape(aid);
+    }
+    function auditShape(aid) {
+      let d = request.resource.data;
+      return exactKeys(['actorUid', 'action', 'entityType', 'entityId', 'at', 'summary'])
+        && d.actorUid == request.auth.uid
+        && d.at == request.time
+        && d.action is string && d.action.size() <= 40
+        && d.entityId is string
+        && d.summary is map && d.summary.size() <= 8
+        && ((d.entityType == 'members' && getAfter(memberPath(d.entityId)).data.lastAuditId == aid)
+            || (d.entityType == 'users' && getAfter(userPath(d.entityId)).data.lastAuditId == aid)
+            || (d.entityType == 'license' && d.entityId == 'main' && getAfter(licensePath()).data.lastAuditId == aid)
+            || (d.entityType == 'gymPublicConfig' && d.entityId == 'main' && getAfter(configPath()).data.lastAuditId == aid));
+    }
+
+    // ---------------------------------------------------------------- later phases: read-only for now
+    // Writes for these collections arrive with their phase (orders and payments in Phase 3, and so on),
+    // each with its own rules and tests. Until then nobody can write them.
+    match /memberships/{id}      { allow read: if ownsMemberDoc() || isFrontDesk() || (isCoach() && resource.data.assignedCoachId == request.auth.uid); }
+    match /membershipEvents/{id} { allow read: if isFrontDesk(); }
+    match /orders/{id}           { allow read: if ownsMemberDoc() || isFrontDesk(); }
+    match /payments/{id}         { allow read: if ownsMemberDoc() || isFrontDesk(); }
+    match /financeEntries/{id}   { allow read: if isAdmin() || isAccountant(); }
+    match /cashSessions/{id}     { allow read: if isAdmin() || isAccountant() || (isCashier() && resource.data.cashierId == request.auth.uid); }
+    match /checkins/{id}         { allow read: if ownsMemberDoc() || isFrontDesk(); }
+    match /plans/{id}            { allow read: if active(); }
+    match /offers/{id}           { allow read: if active(); }
+    match /paymentMethods/{id}   { allow read: if active(); }
+    match /vipTiers/{id}         { allow read: if active(); }
+    match /gymSettings/{id}      { allow read: if isStaff(); }
+    match /banners/{id}          { allow read: if (active() && resource.data.status == 'PUBLISHED') || isAdmin(); }
+    match /workoutPlans/{id}     { allow read: if ownsMemberDoc() || isAdmin() || (isCoach() && resource.data.coachId == request.auth.uid); }
+    match /nutritionPlans/{id}   { allow read: if ownsMemberDoc() || isAdmin() || (isCoach() && resource.data.coachId == request.auth.uid); }
+    match /notifications/{id}    { allow read: if signedIn() && resource.data.recipientId == request.auth.uid; }
+  }
+}

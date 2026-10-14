@@ -1,0 +1,25 @@
+{
+  "indexes": [
+    {"collectionGroup": "members", "queryScope": "COLLECTION", "fields": [{"fieldPath": "status", "order": "ASCENDING"}, {"fieldPath": "fullName", "order": "ASCENDING"}]},
+    {"collectionGroup": "members", "queryScope": "COLLECTION", "fields": [{"fieldPath": "searchTokens", "arrayConfig": "CONTAINS"}, {"fieldPath": "status", "order": "ASCENDING"}]},
+    {"collectionGroup": "members", "queryScope": "COLLECTION", "fields": [{"fieldPath": "vipTierId", "order": "ASCENDING"}, {"fieldPath": "status", "order": "ASCENDING"}]},
+    {"collectionGroup": "members", "queryScope": "COLLECTION", "fields": [{"fieldPath": "assignedCoachId", "order": "ASCENDING"}, {"fieldPath": "status", "order": "ASCENDING"}]},
+    {"collectionGroup": "memberships", "queryScope": "COLLECTION", "fields": [{"fieldPath": "memberId", "order": "ASCENDING"}, {"fieldPath": "startsAt", "order": "DESCENDING"}]},
+    {"collectionGroup": "memberships", "queryScope": "COLLECTION", "fields": [{"fieldPath": "status", "order": "ASCENDING"}, {"fieldPath": "endsAtExclusive", "order": "ASCENDING"}]},
+    {"collectionGroup": "payments", "queryScope": "COLLECTION", "fields": [{"fieldPath": "status", "order": "ASCENDING"}, {"fieldPath": "createdAt", "order": "DESCENDING"}]},
+    {"collectionGroup": "payments", "queryScope": "COLLECTION", "fields": [{"fieldPath": "methodId", "order": "ASCENDING"}, {"fieldPath": "status", "order": "ASCENDING"}, {"fieldPath": "createdAt", "order": "DESCENDING"}]},
+    {"collectionGroup": "payments", "queryScope": "COLLECTION", "fields": [{"fieldPath": "memberId", "order": "ASCENDING"}, {"fieldPath": "createdAt", "order": "DESCENDING"}]},
+    {"collectionGroup": "financeEntries", "queryScope": "COLLECTION", "fields": [{"fieldPath": "type", "order": "ASCENDING"}, {"fieldPath": "postedAt", "order": "DESCENDING"}]},
+    {"collectionGroup": "financeEntries", "queryScope": "COLLECTION", "fields": [{"fieldPath": "category", "order": "ASCENDING"}, {"fieldPath": "postedAt", "order": "DESCENDING"}]},
+    {"collectionGroup": "checkins", "queryScope": "COLLECTION", "fields": [{"fieldPath": "memberId", "order": "ASCENDING"}, {"fieldPath": "verifiedAt", "order": "DESCENDING"}]},
+    {"collectionGroup": "auditLogs", "queryScope": "COLLECTION", "fields": [{"fieldPath": "entityType", "order": "ASCENDING"}, {"fieldPath": "entityId", "order": "ASCENDING"}, {"fieldPath": "at", "order": "DESCENDING"}]},
+    {"collectionGroup": "auditLogs", "queryScope": "COLLECTION", "fields": [{"fieldPath": "actorUid", "order": "ASCENDING"}, {"fieldPath": "at", "order": "DESCENDING"}]},
+    {"collectionGroup": "notifications", "queryScope": "COLLECTION", "fields": [{"fieldPath": "recipientId", "order": "ASCENDING"}, {"fieldPath": "createdAt", "order": "DESCENDING"}]},
+    {"collectionGroup": "banners", "queryScope": "COLLECTION", "fields": [{"fieldPath": "status", "order": "ASCENDING"}, {"fieldPath": "priority", "order": "DESCENDING"}]}
+  ],
+  "fieldOverrides": [
+    {"collectionGroup": "auditLogs", "fieldPath": "summary", "indexes": []},
+    {"collectionGroup": "gymPublicConfig", "fieldPath": "logoDataUrl", "indexes": []},
+    {"collectionGroup": "members", "fieldPath": "searchTokens", "indexes": [{"arrayConfig": "CONTAINS", "queryScope": "COLLECTION"}]}
+  ]
+}
