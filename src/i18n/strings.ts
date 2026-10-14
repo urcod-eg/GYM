@@ -24,6 +24,7 @@ const ar = {
   'app.noResults': 'لا توجد نتائج مطابقة',
   'app.loadMore': 'عرض المزيد',
   'app.cloudDemo': 'وضع تجريبي — غير متصل بالسحابة',
+  'app.cloudLive': 'متصل بالسحابة',
   'app.showing': 'عرض {n} من {total}',
 
   'role.member': 'مشترك',
@@ -488,6 +489,7 @@ const en: Record<BaseKey, string> = {
   'app.noResults': 'No matching results',
   'app.loadMore': 'Load more',
   'app.cloudDemo': 'Demo mode — not connected to the cloud',
+  'app.cloudLive': 'Connected to the cloud',
   'app.showing': 'Showing {n} of {total}',
 
   'role.member': 'Member',

@@ -62,9 +62,9 @@ export function Prefs({ compact }: { compact?: boolean }) {
 export function CloudStatus() {
   const { t } = useApp();
   return (
-    <span className="cloud-pill" title={t('app.cloudDemo')}>
-      <Icon name="cloudOff" />
-      <span className="desktop-only">{t('app.cloudDemo')}</span>
+    <span className="cloud-pill" data-live={!demoMode || undefined} title={t(demoMode ? 'app.cloudDemo' : 'app.cloudLive')}>
+      <Icon name={demoMode ? 'cloudOff' : 'cloud'} />
+      <span className="desktop-only">{t(demoMode ? 'app.cloudDemo' : 'app.cloudLive')}</span>
     </span>
   );
 }

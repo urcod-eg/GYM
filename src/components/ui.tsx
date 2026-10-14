@@ -6,6 +6,7 @@ import { useApp } from '../app/AppContext';
 import type { MembershipPhase } from '../domain/dates';
 import type { VipTier } from '../mock/demo';
 import { Icon, type IconName } from './Icon';
+import { mediaUrl, PhotoTile, PROMO_FIGURES } from './Media';
 
 export function StatusBadge({ phase, blocked, cancelled }: { phase: MembershipPhase; blocked?: boolean; cancelled?: boolean }) {
   const { t } = useApp();
@@ -104,7 +105,8 @@ export function PlaceholderPage({ title, phase }: { title: string; phase: number
   const { t } = useApp();
   return (
     <div className="placeholder-page">
-      <div className="stack-sm" style={{ alignItems: 'center' }}>
+      <img className="placeholder-figure" src={mediaUrl('abs')} alt="" aria-hidden="true" loading="lazy" />
+      <div className="stack-sm" style={{ alignItems: 'center', position: 'relative' }}>
         <Icon name="clock" />
         <h1 className="page-title">{title}</h1>
         <p className="muted">{t('admin.comingPhase', { n: phase })}</p>
@@ -191,7 +193,7 @@ export function PromoCard({
         <Heading className="promo-title">{title}</Heading>
         <p className="promo-body">{body}</p>
       </div>
-      <ArtTile variant={variant} />
+      <PhotoTile {...PROMO_FIGURES[((variant % 4) + 4) % 4]} large={large} />
     </article>
   );
 }

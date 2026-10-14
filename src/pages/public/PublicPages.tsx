@@ -4,7 +4,8 @@ import { useApp } from '../../app/AppContext';
 import { GymLogoButton, UrcodLogo } from '../../components/Brand';
 import { Icon } from '../../components/Icon';
 import { Footer, Prefs, APP_VERSION } from '../../components/Shell';
-import { ArtTile, Modal, Notice, Toasts } from '../../components/ui';
+import { Modal, Notice, Toasts } from '../../components/ui';
+import { HeroStage, mediaUrl, type Figure } from '../../components/Media';
 import { normalizeEgyptPhone } from '../../domain/text';
 import { isIOS, promptInstall, useInstallState } from '../../app/install';
 import { demoMode, firebase } from '../../firebase/client';
@@ -16,7 +17,7 @@ import { useGym } from '../../app/GymContext';
 import type { StringKey } from '../../i18n/strings';
 import type { MultiFactorError, MultiFactorResolver } from 'firebase/auth';
 
-function AuthFrame({ children, kicker }: { children: React.ReactNode; kicker?: string }) {
+function AuthFrame({ children, kicker, figure = 'ropes' }: { children: React.ReactNode; kicker?: string; figure?: Figure }) {
   const { lang, applyRoleDefault } = useApp();
   const gym = useGym();
   useEffect(() => applyRoleDefault('dark'), [applyRoleDefault]);
@@ -34,12 +35,14 @@ function AuthFrame({ children, kicker }: { children: React.ReactNode; kicker?: s
             </div>
             <Prefs compact />
           </div>
-          <div className="stack-sm" style={{ maxWidth: 520 }}>
-            {kicker && <span className="promo-tag">{kicker}</span>}
-            <h1 className="display">{lang === 'ar' ? 'أقوى كل يوم' : 'STRONGER EVERY DAY'}</h1>
-            <p style={{ color: '#c9ccd5', fontSize: '1.0625rem' }}>{lang === 'ar' ? gym.taglineAr : gym.taglineEn}</p>
+          <div className="hero-body">
+            <div className="hero-copy stack-sm">
+              {kicker && <span className="promo-tag">{kicker}</span>}
+              <h1 className="display">{lang === 'ar' ? 'أقوى كل يوم' : 'STRONGER EVERY DAY'}</h1>
+              <p style={{ color: '#c9ccd5', fontSize: '1.0625rem' }}>{lang === 'ar' ? gym.taglineAr : gym.taglineEn}</p>
+            </div>
+            <HeroStage figure={figure} />
           </div>
-          <ArtTile variant={0} shape="wide" />
         </section>
         <section className="auth-panel">{children}</section>
       </div>
@@ -346,7 +349,7 @@ export function StaffLoginPage() {
   const [params] = useSearchParams();
   const role = params.get('role') === 'admin' ? 'admin' : 'cashier';
   return (
-    <AuthFrame kicker={t(role === 'admin' ? 'role.admin' : 'role.cashier')}>
+    <AuthFrame kicker={t(role === 'admin' ? 'role.admin' : 'role.cashier')} figure={role === 'admin' ? 'curl' : 'squat'}>
       <div className="stack">
         <StaffPhoneForm title={t(role === 'admin' ? 'login.staffAdmin' : 'login.staffCashier')} demoRoles={[role]} onDone={(roles) => navigate(homeFor(roles), { replace: true })} />
         <Link to="/" className="btn btn-ghost btn-sm" style={{ alignSelf: 'flex-start' }}>{t('app.back')}</Link>
@@ -364,6 +367,7 @@ export function DevLoginPage() {
     <>
       <main className="main narrow" style={{ minHeight: '80dvh', display: 'grid', placeItems: 'center' }}>
         <div className="card stack" style={{ width: '100%', maxWidth: 420 }}>
+          <img className="dev-gear" src={mediaUrl('gear')} alt="" aria-hidden="true" />
           <div className="row">
             <Icon name="shield" width={28} height={28} style={{ color: 'var(--primary-text)' }} />
             <span className="muted small">{t('login.devMfa')}</span>
@@ -426,7 +430,7 @@ export function ActivatePage() {
   const roles = invite?.roles.map((r) => t(`role.${r}` as StringKey)).join('، ') ?? '';
 
   return (
-    <AuthFrame>
+    <AuthFrame figure="flex">
       {!code && !demoMode ? (
         <Notice tone="danger" icon="alert">{t('act.noToken')}</Notice>
       ) : linkErr ? (
