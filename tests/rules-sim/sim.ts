@@ -539,7 +539,8 @@ function call(name: string, argNodes: Node[], f: Frame, ctx: EvalContext): RV {
   const args = argNodes.map((a) => evalNode(a, f, ctx));
   const lookup = (after: boolean) => {
     const p = docPathFrom(args[0]);
-    ctx.lookups.add(`${after ? 'after' : 'before'}:${p}`);
+    // Strict, like the official emulator: each (function, document) pair is its own access call.
+    ctx.lookups.add(`${name}:${p}`);
     return { p, doc: (after ? ctx.after : ctx.before).get(p) };
   };
   switch (name) {

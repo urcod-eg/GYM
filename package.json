@@ -3,6 +3,7 @@
   "version": "1.2.0-phase2",
   "description": "Gym Management PWA — urcod",
   "scripts": {
+    "prebuild": "node scripts/gym-brand.mjs",
     "dev": "vite",
     "build": "tsc --noEmit -p . && vite build",
     "preview": "vite preview",
@@ -12,7 +13,8 @@
     "test:rules": "firebase emulators:exec --only firestore --project demo-gym \"vitest run -c vitest.rules.config.ts\"",
     "test:all": "npm run typecheck && npm test && npm run lint:rules && npm run test:rules",
     "emulators": "firebase emulators:start --only auth,firestore --project demo-gym",
-    "deploy": "firebase deploy --only firestore"
+    "deploy": "firebase deploy --only firestore",
+    "brand": "node scripts/gym-brand.mjs"
   },
   "author": "urcod — Mahmoud Gamal Eldeen",
   "license": "UNLICENSED",
@@ -33,6 +35,7 @@
     "antlr4": "^4.13.1",
     "eslint": "^9.39.5",
     "firebase-tools": "^15.33.0",
+    "sharp": "^0.34.5",
     "typescript": "^7.0.2",
     "vite": "^8.3.4",
     "vite-plugin-singlefile": "^2.3.3",

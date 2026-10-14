@@ -31,12 +31,13 @@ service cloud.firestore {
     // ---------------------------------------------------------------- who is asking
     function signedIn() { return request.auth != null; }
     function me() { return get(userPath(request.auth.uid)).data; }
-    function active() { return signedIn() && exists(userPath(request.auth.uid)) && me().status == 'active'; }
+    // Firestore allows only a few document lookups per rule, so each helper reads a document once
+    // (a missing document makes get() fail, which counts as "no").
+    function active() { return signedIn() && me().status == 'active'; }
     // Staff roles count only in a session opened with the 4-digit code for this very sign-in
     // (auth_time changes with every new sign-in, so a stolen password alone is not enough).
     function staffSessionOk() {
-      return exists(sessionPath(request.auth.uid))
-        && get(sessionPath(request.auth.uid)).data.authTime == request.auth.token.auth_time;
+      return get(sessionPath(request.auth.uid)).data.authTime == request.auth.token.auth_time;
     }
     // Staff and the developer: roles count only after the second step (code / code + security phrase).
     function hasRole(r) { return active() && r in me().roles && (me().kind == 'member' || staffSessionOk()); }
@@ -53,9 +54,8 @@ service cloud.firestore {
     function devMfa() { return isDev(); }
 
     function licensed() {
-      return exists(licensePath())
-        && get(licensePath()).data.state == 'ACTIVE'
-        && (get(licensePath()).data.endsAt == null || request.time < get(licensePath()).data.endsAt);
+      let l = get(licensePath()).data;
+      return l.state == 'ACTIVE' && (l.endsAt == null || request.time < l.endsAt);
     }
     function adminWriter() { return (hasRole('admin') && licensed()) || devMfa(); }
     // Managing another staff account: never yourself; admins only non-admins; the developer (2FA) anyone.
@@ -84,11 +84,10 @@ service cloud.firestore {
     // The write must create a new audit entry describing exactly this change.
     function freshAudit(action, type, id) {
       let a = request.resource.data.lastAuditId;
-      return a is string
-        && !exists(auditPath(a))
-        && getAfter(auditPath(a)).data.action == action
-        && getAfter(auditPath(a)).data.entityType == type
-        && getAfter(auditPath(a)).data.entityId == id;
+      let e = getAfter(auditPath(a)).data;
+      // Written in this very request (the audit collection is create-only, so it is a new entry).
+      return a is string && e.at == request.time
+        && e.action == action && e.entityType == type && e.entityId == id;
     }
 
     // An invite redeemed in this very request by the signed-in (brand new) account.
@@ -360,11 +359,12 @@ service cloud.firestore {
       let no = d.memberNo;
       return exactKeys(['memberNo', 'memberCode', 'fullName', 'phoneE164', 'authUid', 'accountStatus', 'assignedCoachId', 'vipTierId', 'blocks', 'searchTokens', 'lastInviteId', 'createdAt', 'createdBy', 'updatedAt', 'lastAuditId'])
         && no is int
-        && ((exists(counterPath()) && get(counterPath()).data.next == no) || (!exists(counterPath()) && no == 10001))
+        // The counter rule (counterBump) checks the number against the stored counter; here we only
+        // check that the counter moves to this member in the same write.
         && getAfter(counterPath()).data.next == no + 1
         && getAfter(counterPath()).data.lastMemberId == m
-        && ((exists(configPath()) && d.memberCode == get(configPath()).data.codePrefix + '-' + string(no))
-            || (!exists(configPath()) && d.memberCode == 'GYM-' + string(no)))
+        && d.memberCode is string && d.memberCode.matches('^[A-Z]{2,5}-[0-9]+$')
+        && d.memberCode.split('-')[1] == string(no)
         && d.fullName is string && d.fullName.size() >= 2 && d.fullName.size() <= 80
         && validPhone(d.phoneE164)
         && getAfter(phonePath(d.phoneE164)).data.memberId == m
@@ -404,7 +404,7 @@ service cloud.firestore {
       allow create: if frontDeskWriter()
         && exactKeys(['memberId', 'createdAt'])
         && request.resource.data.createdAt == request.time
-        && !exists(memberPath(request.resource.data.memberId))
+        && getAfter(memberPath(request.resource.data.memberId)).data.createdAt == request.time
         && getAfter(memberPath(request.resource.data.memberId)).data.phoneE164 == p;
     }
 
@@ -419,7 +419,7 @@ service cloud.firestore {
       return exactKeys(['next', 'lastMemberId', 'updatedAt'])
         && d.next == no + 1
         && d.updatedAt == request.time
-        && !exists(memberPath(d.lastMemberId))
+        && getAfter(memberPath(d.lastMemberId)).data.createdAt == request.time
         && getAfter(memberPath(d.lastMemberId)).data.memberNo == no;
     }
 
