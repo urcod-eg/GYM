@@ -100,9 +100,11 @@ interface ShellProps {
   livePaths?: string[];
   /** Wording of that notice (members get a friendlier one). */
   sampleNote?: StringKey;
+  /** Extra buttons in the top bar (e.g. the member's notice bell). */
+  topExtra?: ReactNode;
 }
 
-export function Shell({ children, nav, bottomNav, defaultTheme, showCloud, width = 'wide', title, livePaths = [], sampleNote = 'app.sampleScreen' }: ShellProps) {
+export function Shell({ children, nav, bottomNav, defaultTheme, showCloud, width = 'wide', title, livePaths = [], sampleNote = 'app.sampleScreen', topExtra }: ShellProps) {
   const { lang, t, applyRoleDefault } = useApp();
   const [drawer, setDrawer] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
@@ -164,6 +166,7 @@ export function Shell({ children, nav, bottomNav, defaultTheme, showCloud, width
           </span>
         </div>
         {showCloud && <CloudStatus />}
+        {topExtra}
         <Prefs compact />
         {!demoMode && session.user && (
           <button className="icon-btn" onClick={() => session.signOut().then(() => navigate('/', { replace: true }))} aria-label={t('dev.signOut')} title={t('dev.signOut')}>

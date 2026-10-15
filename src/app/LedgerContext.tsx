@@ -31,7 +31,7 @@ export interface Cancellation {
   at: string;
 }
 
-export type SettingsView = DepositSettings & { cashierMaxDiscount: number };
+export type SettingsView = DepositSettings & { cashierMaxDiscount: number; genderMode: GymSettingsDoc['genderMode']; ladiesHours: GymSettingsDoc['ladiesHours'] };
 
 const toView = (s: GymSettingsDoc): SettingsView => ({
   enabled: s.depositEnabled,
@@ -39,6 +39,8 @@ const toView = (s: GymSettingsDoc): SettingsView => ({
   graceDays: s.depositGraceDays,
   maxGraceDays: s.depositMaxGraceDays,
   cashierMaxDiscount: s.cashierMaxDiscount,
+  genderMode: s.genderMode ?? 'MIXED',
+  ladiesHours: s.ladiesHours ?? {},
 });
 export const toSettingsDoc = (v: SettingsView): GymSettingsDoc => ({
   depositEnabled: v.enabled,
@@ -46,6 +48,8 @@ export const toSettingsDoc = (v: SettingsView): GymSettingsDoc => ({
   depositGraceDays: v.graceDays,
   depositMaxGraceDays: v.maxGraceDays,
   cashierMaxDiscount: v.cashierMaxDiscount,
+  genderMode: v.genderMode,
+  ladiesHours: v.ladiesHours,
 });
 
 interface LedgerState {

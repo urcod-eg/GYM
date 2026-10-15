@@ -1,3 +1,5 @@
+import { GenderFilter, GenderPicker, MemberGenderControl, useGenderMode } from './GenderUI';
+import type { Gender } from '../../domain/gender';
 import { useMemo, useState, type FormEvent } from 'react';
 import { DateTime } from 'luxon';
 import { Link, Navigate, Route, Routes, useNavigate, useSearchParams } from 'react-router-dom';
@@ -58,7 +60,9 @@ function Reception() {
   const navigate = useNavigate();
   const [q, setQ] = useState('');
   const rows = useRows();
-  const results = useMemo(() => searchRows(rows, q).slice(0, 25), [rows, q]);
+  const [gender, setGender] = useState<Gender | 'ALL'>('ALL');
+  const genderOn = useGenderMode().mode !== 'MIXED';
+  const results = useMemo(() => searchRows(rows, q).filter((r) => gender === 'ALL' || r.m.gender === gender).slice(0, 25), [rows, q, gender]);
   const [selId, setSelId] = useState<string | null>(demoMode ? 'm1' : null);
   const sel = rows.find((r) => r.m.id === selId) ?? (q ? results[0] : null) ?? null;
   const day = useTodayTotals(actor.uid);
@@ -91,6 +95,11 @@ function Reception() {
       {rowsError && <Notice tone="danger" icon="alert">{t('acc.loadError')}</Notice>}
       <div className="grid-2" style={{ alignItems: 'start' }}>
         <section className="card" style={{ padding: 8 }} aria-label={t('app.search')}>
+          {genderOn && (
+            <div style={{ padding: '4px 4px 8px' }}>
+              <GenderFilter value={gender} onChange={setGender} />
+            </div>
+          )}
           {!demoMode && liveRows === null ? (
             <p className="muted" style={{ padding: 16 }} aria-busy="true">…</p>
           ) : rows.length === 0 ? (
@@ -164,6 +173,7 @@ function MemberPanel({ r }: { r: MemberRow }) {
           </div>
         </div>
       </div>
+      <MemberGenderControl key={r.m.id} memberId={r.m.id} gender={r.m.gender} />
       {r.m.blocked && <Notice tone="danger" icon="shield">{t('cashier.blockedNote')}</Notice>}
       {r.phase === 'NONE' && <Notice icon="info">{t('sale.noMembership')}</Notice>}
       {bal && (
@@ -305,6 +315,9 @@ function QuickRegister({ renewId }: { renewId: string | null }) {
 
   const [name, setName] = useState(renewing?.m.name ?? '');
   const [phone, setPhone] = useState(renewing ? '0' + renewing.m.phone.slice(3) : '');
+  const { mode: genderMode } = useGenderMode();
+  const [gender, setGender] = useState<Gender | null>(null);
+  const needGender = !renewing && genderMode !== 'MIXED';
   const { activePlans, loading: plansLoading } = usePlans();
   const [planId, setPlanId] = useState(renewing?.m.planId || activePlans.find((p) => p.code === 'M1')?.id || activePlans[0]?.id || '');
   const [customDays, setCustomDays] = useState(30);
@@ -368,8 +381,9 @@ function QuickRegister({ renewId }: { renewId: string | null }) {
     name: !name.trim() ? t('reg.required') : null,
     phone: !e164 ? t('login.invalidPhone') : null,
     days: isCustom && !customOk ? t('reg.daysRange') : null,
+    gender: needGender && !gender ? t('gender.required') : null,
   };
-  const valid = !!plan && !errors.name && !errors.phone && !errors.days && !dupe && !!endExclusive && pay.errors.length === 0 && dueDateOk && discountOk;
+  const valid = !!plan && !errors.name && !errors.phone && !errors.days && !errors.gender && !dupe && !!endExclusive && pay.errors.length === 0 && dueDateOk && discountOk;
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
@@ -402,7 +416,7 @@ function QuickRegister({ renewId }: { renewId: string | null }) {
       let newDoc: data.MemberDoc | null = null;
       if (!row) {
         const id = await data.newMemberId();
-        const reg = await data.registerMember(actor, { memberId: id, fullName: name, phone });
+        const reg = await data.registerMember(actor, { memberId: id, fullName: name, phone, gender });
         if (reg.existing) {
           setErr(t('err.phone-registered'));
           return;
@@ -497,6 +511,12 @@ function QuickRegister({ renewId }: { renewId: string | null }) {
             </Notice>
           )}
         </div>
+        {needGender && (
+          <>
+            <GenderPicker value={gender} onChange={setGender} id="reg-g" required />
+            {touched && errors.gender && <span className="error">{errors.gender}</span>}
+          </>
+        )}
         <div className="field">
           <span className="label" id="plan-l">{t('reg.plan')}</span>
           <div className="chips" role="group" aria-labelledby="plan-l">

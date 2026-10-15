@@ -17,6 +17,7 @@ export interface RowMember {
   lastCheckIn: string | null;
   blocked: boolean;
   planId: string;
+  gender?: 'M' | 'F' | null;
 }
 
 export type RowPhase = MembershipPhase | 'NONE';
@@ -38,6 +39,9 @@ export interface MemberRow {
   doc: MemberDoc | null;
 }
 
+/** Sample ladies in the preview (by first name). */
+const DEMO_LADIES = /^(سارة|منة|هبة|آية|نورهان|مريم|ندى|سلمى|ياسمين|فاطمة|نور)/;
+
 /** Preview rows (sample data). */
 export function demoRows(): MemberRow[] {
   const now = DateTime.now().setZone(GYM_TZ);
@@ -45,7 +49,7 @@ export function demoRows(): MemberRow[] {
     const { start, end } = memberDates(m);
     const plan = planById(m.planId);
     return {
-      m: { id: m.id, name: m.name, code: m.code, phone: m.phone, vip: m.vip, coachId: m.coachId, lastCheckIn: m.lastCheckIn, blocked: !!m.blocked, planId: m.planId },
+      m: { id: m.id, name: m.name, code: m.code, phone: m.phone, vip: m.vip, coachId: m.coachId, lastCheckIn: m.lastCheckIn, blocked: !!m.blocked, planId: m.planId, gender: DEMO_LADIES.test(m.name) ? 'F' : 'M' },
       start,
       end,
       phase: phaseAt(now, start, end),
@@ -68,7 +72,7 @@ export function liveRow(d: MemberDoc, now: Date = new Date()): MemberRow {
   const end = p ? DateTime.fromJSDate(p.endsAt).setZone(GYM_TZ) : null;
   const blocked = activeBlocks(d.blocks, now).some((s) => s === 'CHECKIN_BLOCK' || s === 'TEMPORARY_SUSPENSION' || s === 'LOGIN_BLOCK');
   return {
-    m: { id: d.id, name: d.fullName, code: d.memberCode, phone: d.phoneE164, vip: d.vipTierId ?? 'STANDARD', coachId: d.assignedCoachId, lastCheckIn: d.lastCheckInAt ? d.lastCheckInAt.toISOString() : null, blocked, planId: '' },
+    m: { id: d.id, name: d.fullName, code: d.memberCode, phone: d.phoneE164, vip: d.vipTierId ?? 'STANDARD', coachId: d.assignedCoachId, lastCheckIn: d.lastCheckInAt ? d.lastCheckInAt.toISOString() : null, blocked, planId: '', gender: d.gender ?? null },
     phase: start && end ? phaseAt(DateTime.fromJSDate(now), start, end) : 'NONE',
     start,
     end,

@@ -6,6 +6,7 @@ import { LineChart } from '../../components/Charts';
 import { Icon } from '../../components/Icon';
 import { Shell, type NavItem } from '../../components/Shell';
 import { TabHero } from '../../components/Media';
+import { NoticeBell } from './NoticeBell';
 import { IllustrativeCode, Modal, Notice, PromoCard, VipBadge } from '../../components/ui';
 import { GYM_TZ, daysRemaining, lastUsableDay, phaseAt, type MembershipPhase } from '../../domain/dates';
 import { DEMO_BALANCES, DEMO_COACHES, DEMO_MEMBERS, DEMO_WEEK, DEMO_WEIGHT, DEMO_WORKOUT, memberDates, planById, type VipTier } from '../../mock/demo';
@@ -125,7 +126,7 @@ export function MemberArea() {
   ];
   return (
     <MemberProvider>
-      <Shell bottomNav={nav} defaultTheme="dark" width="narrow" sampleNote="app.sampleScreenMember" livePaths={['/member']}>
+      <Shell bottomNav={nav} defaultTheme="dark" width="narrow" sampleNote="app.sampleScreenMember" livePaths={['/member']} topExtra={<MemberBell />}>
         {demoMode && <PreviewSwitch />}
         <Routes>
           <Route index element={<MemberHome />} />
@@ -138,6 +139,11 @@ export function MemberArea() {
       </Shell>
     </MemberProvider>
   );
+}
+
+function MemberBell() {
+  const { m, phase } = useMember();
+  return <NoticeBell memberId={demoMode ? 'demo' : m.id || null} active={phase === 'ACTIVE'} vip={m.vip !== 'STANDARD'} />;
 }
 
 /** Paid services are locked when not ACTIVE. In production the SERVER refuses them too. */

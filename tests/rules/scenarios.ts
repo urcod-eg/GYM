@@ -27,6 +27,7 @@ import {
   unlockPin,
   wipeRecord,
   wipeDeletes,
+  setMemberGender,
   type InviteDoc,
   type WriteOp,
 } from '../../src/domain/writes';
@@ -46,6 +47,7 @@ import {
 } from '../../src/domain/sales';
 import { DateTime } from 'luxon';
 import { setBanner, setVipTier, setMemberVip, type BannerDoc } from '../../src/domain/content';
+import { archiveNotice, readNotice, sendNotice, type NoticeInput } from '../../src/domain/notices';
 import { checkIn, writeToken, type EntryMember } from '../../src/domain/attendance';
 import { addFinanceEntry, closeCash, voidFinanceEntry } from '../../src/domain/finance';
 import { addWeight, assignCoach, setLibraryExercise, setNutritionPlan, setWorkoutDay, setWorkoutPlan, type WorkoutPlan } from '../../src/domain/coaching';
@@ -228,6 +230,11 @@ export function defineScenarios(name: string, h: Harness) {
       });
       it('every registration needs its audit entry', async () => {
         await denied(registerAs(CASHIER, 'منى حسن', '01014445555', (ops) => ops.filter((o) => !o.path.startsWith('auditLogs/'))));
+      });
+      it('a new member may be registered as men or ladies, nothing else', async () => {
+        const g = (v: unknown) => (ops: WriteOp[]) => ops.map((o) => (o.path.startsWith('members/') ? { ...o, data: { ...o.data, gender: v } } : o));
+        await denied(registerAs(CASHIER, 'منى حسن', '01014445555', g('X')));
+        await ok(registerAs(CASHIER, 'منى حسن', '01014445555', g('F')));
       });
       it('a new member cannot start active, linked, VIP or blocked', async () => {
         const patch = (p: Data) => (ops: WriteOp[]) => ops.map((o) => (o.path.startsWith('members/') ? { ...o, data: { ...o.data, ...p } } : o));
@@ -665,6 +672,60 @@ export function defineScenarios(name: string, h: Harness) {
       const scan = async (who: AuthSpec, code: string, counts = false) =>
         h.as(who).commit(checkIn({ actorUid: who.uid, checkinId: nextId('ci-'), member: await em(), method: 'QR', code, counts }) as Op[]);
 
+      describe('men / ladies', () => {
+        const ALL_DAY = Array.from({ length: 24 }, (_, i) => i);
+        const settingsWith = (genderMode: 'MIXED' | 'SPLIT_HOURS' | 'SEPARATE', ladiesHours: Record<string, number[]>) =>
+          h.seed({ 'gymSettings/main': { ...DEFAULT_GYM_SETTINGS, genderMode, ladiesHours, updatedAt: new Date(), lastAuditId: 'seed-gs' } });
+        const manualIn = async () => h.as(CASHIER).commit(checkIn({ actorUid: 'cash1', checkinId: nextId('ci-'), member: await em(), method: 'MANUAL', code: null, counts: false }) as Op[]);
+        const everyDay = Object.fromEntries(['0', '1', '2', '3', '4', '5', '6'].map((d) => [d, ALL_DAY]));
+        it("ladies' hours: only ladies then, only men otherwise; a member with no gender waits until it is set", async () => {
+          await settingsWith('SPLIT_HOURS', everyDay);
+          await seedMember({ gender: 'F' });
+          await ok(manualIn());
+          await seedMember({ gender: 'M' });
+          await denied(manualIn());
+          await seedMember({ gender: null });
+          await denied(manualIn());
+          await settingsWith('SPLIT_HOURS', {});
+          await seedMember({ gender: 'M' });
+          await ok(manualIn());
+          await seedMember({ gender: 'F' });
+          await denied(manualIn());
+          await settingsWith('MIXED', everyDay);
+          await seedMember({ gender: 'M' });
+          await ok(manualIn());
+        });
+        it("ladies' hours follow the gym's weekday (Cairo time)", async () => {
+          const cairo = DateTime.now().setZone('Africa/Cairo');
+          if (cairo.hour === 0 || cairo.hour >= 23) return; // the two possible UTC offsets straddle midnight
+          await settingsWith('SPLIT_HOURS', { [String(cairo.weekday % 7)]: ALL_DAY });
+          await seedMember({ gender: 'F' });
+          await ok(manualIn());
+          await settingsWith('SPLIT_HOURS', { [String((cairo.weekday + 1) % 7)]: ALL_DAY });
+          await seedMember({ gender: 'F' });
+          await denied(manualIn());
+        });
+        it('the front desk sets men / ladies on a file (with its audit entry); a coach cannot', async () => {
+          await seedMember();
+          await ok(h.as(CASHIER).commit(setMemberGender({ actorUid: 'cash1', auditId: nextId('mg-'), memberId: 'mem2', gender: 'F' })));
+          expect((await h.peek('members/mem2'))?.gender).toBe('F');
+          await denied(h.as(COACH).commit(setMemberGender({ actorUid: 'coach1', auditId: nextId('mg-'), memberId: 'mem2', gender: 'M' })));
+          const bad = setMemberGender({ actorUid: 'cash1', auditId: nextId('mg-'), memberId: 'mem2', gender: 'M' });
+          (bad[0].data as Record<string, unknown>).gender = 'X';
+          await denied(h.as(CASHIER).commit(bad));
+        });
+        it("separate ladies' section: a member's coach is of the same section", async () => {
+          await settingsWith('SEPARATE', {});
+          await ok(h.as(ADMIN).commit(updateStaff({ actorUid: 'admin1', actorRoles: ['admin'], auditId: nextId('sg-'), target: { uid: 'coach1', roles: ['coach'], status: 'active', kind: 'staff' }, gender: 'M' })));
+          await seedMember({ gender: 'F' });
+          await denied(h.as(ADMIN).commit(assignCoach({ actorUid: 'admin1', auditId: nextId('ac-'), memberId: 'mem2', coach: { uid: 'coach1', name: 'موظف' } })));
+          await seedMember({ gender: null });
+          await denied(h.as(ADMIN).commit(assignCoach({ actorUid: 'admin1', auditId: nextId('ac-'), memberId: 'mem2', coach: { uid: 'coach1', name: 'موظف' } })));
+          await seedMember({ gender: 'M' });
+          await ok(h.as(ADMIN).commit(assignCoach({ actorUid: 'admin1', auditId: nextId('ac-'), memberId: 'mem2', coach: { uid: 'coach1', name: 'موظف' } })));
+        });
+      });
+
       it('the member writes a code; the cashier scans it once; a second scan of the same code is refused', async () => {
         await seedMember();
         await ok(h.as(MEMBER2).commit(writeToken('mem2', 'ABCD2345')));
@@ -752,6 +813,64 @@ export function defineScenarios(name: string, h: Harness) {
         const ops = setBanner({ actorUid: 'admin1', auditId: 'bn-x', bannerId: 'b4', banner });
         (ops[0].data as Record<string, unknown>).figure = 'https://evil.example/x.png';
         await denied(h.as(ADMIN).commit(ops));
+      });
+    });
+
+    describe('in-app notices (admin → members)', () => {
+      const MEMBER2N = { uid: 'u-mem2', email: email(2) };
+      const seedMember2 = () =>
+        h.seed({
+          'members/mem2': { ...member('mem2', 10002, 'سارة محمود', PHONE_MEM2, 'u-mem2', null) },
+          'users/u-mem2': { kind: 'member', roles: ['member'], status: 'active', displayName: 'سارة', phone: PHONE_MEM2, memberId: 'mem2', inviteId: 'seed', createdAt: new Date() },
+        });
+      const send = (who: AuthSpec, actorUid: string, noticeId: string, input: NoticeInput) => sendNotice({ actorUid, auditId: nextId('nt-'), noticeId, input });
+      it('an admin sends to everyone; members read it and mark it read once; a cashier cannot send', async () => {
+        const r = send(ADMIN, 'admin1', 'n-all', { title: 'تغيير المواعيد', body: 'الجيم بيفتح 7 الصبح من السبت', audience: 'ALL', memberIds: [] });
+        expect(r.rest).toHaveLength(0);
+        await ok(h.as(ADMIN).commit(r.first));
+        await denied(h.as(CASHIER).commit(send(CASHIER, 'cash1', 'n-c', { title: 'تجربة', body: 'x', audience: 'ALL', memberIds: [] }).first));
+        await ok(h.as(MEMBER1).get('notices/n-all'));
+        expect((await h.as(MEMBER1).list('notices', 'public', true)).length).toBeGreaterThan(0);
+        await ok(h.as(MEMBER1).commit(readNotice({ noticeId: 'n-all', memberId: 'mem1' })));
+        await denied(h.as(MEMBER1).commit(readNotice({ noticeId: 'n-all', memberId: 'mem1' })));
+        await denied(h.as(MEMBER1).commit(readNotice({ noticeId: 'n-all', memberId: 'mem2' })));
+        await denied(h.as(MEMBER1).commit(readNotice({ noticeId: 'n-none', memberId: 'mem1' })));
+        await h.seed({ 'noticeReads/n-all_mem2': { noticeId: 'n-all', memberId: 'mem2', at: new Date() } });
+        expect(await h.as(ADMIN).list('noticeReads', 'noticeId', 'n-all')).toHaveLength(2);
+        // a member cannot see who else read it
+        await denied(h.as(MEMBER1).list('noticeReads', 'noticeId', 'n-all'));
+        expect(await h.as(MEMBER1).list('noticeReads', 'memberId', 'mem1')).toHaveLength(1);
+      });
+      it('a notice to chosen members reaches only them', async () => {
+        await seedMember2();
+        const r = send(ADMIN, 'admin1', 'n-list', { title: 'باقي الاشتراك', body: 'من فضلك كمّل الباقي', audience: 'LIST', memberIds: ['mem2'] });
+        await ok(h.as(ADMIN).commit(r.first));
+        for (const c of r.rest) await ok(h.as(ADMIN).commit(c));
+        await denied(h.as(MEMBER1).get('notices/n-list'));
+        await denied(h.as(MEMBER2N).get('notices/n-list'));
+        // a full write of copies stays inside the rules budget
+        const many = send(ADMIN, 'admin1', 'n-many', { title: 'تنبيه', body: 'للمجموعة', audience: 'LIST', memberIds: ['mem1', 'mem2', 'mem3'] });
+        await ok(h.as(ADMIN).commit(many.first));
+        expect(many.rest[0]).toHaveLength(3);
+        await ok(h.as(ADMIN).commit(many.rest[0]));
+        expect(await h.as(MEMBER2N).list('inbox', 'memberId', 'mem2')).toHaveLength(2);
+        await denied(h.as(MEMBER1).list('inbox', 'memberId', 'mem2'));
+        await ok(h.as(MEMBER2N).commit(readNotice({ noticeId: 'n-list', memberId: 'mem2' })));
+        // copies must match the notice, go to real members, and come from its author
+        const bad = send(ADMIN, 'admin1', 'n-list', { title: 'باقي الاشتراك', body: 'نص تاني', audience: 'LIST', memberIds: ['mem1'] }).rest[0];
+        await denied(h.as(ADMIN).commit(bad));
+        await denied(h.as(ADMIN).commit(send(ADMIN, 'admin1', 'n-list', { title: 'باقي الاشتراك', body: 'من فضلك كمّل الباقي', audience: 'LIST', memberIds: ['ghost'] }).rest[0]));
+        await denied(h.as(CASHIER).commit(send(CASHIER, 'cash1', 'n-list', { title: 'باقي الاشتراك', body: 'من فضلك كمّل الباقي', audience: 'LIST', memberIds: ['mem1'] }).rest[0]));
+        // a "public" flag cannot be forced on a chosen-members notice
+        const leak = send(ADMIN, 'admin1', 'n-leak', { title: 'سري', body: 'x', audience: 'LIST', memberIds: ['mem2'] });
+        (leak.first[0].data as Record<string, unknown>).public = true;
+        await denied(h.as(ADMIN).commit(leak.first));
+      });
+      it('only an admin archives a notice', async () => {
+        await ok(h.as(ADMIN).commit(send(ADMIN, 'admin1', 'n-arc', { title: 'عرض', body: 'خصم', audience: 'VIP', memberIds: [] }).first));
+        await denied(h.as(CASHIER).commit(archiveNotice({ actorUid: 'cash1', auditId: nextId('na-'), noticeId: 'n-arc' })));
+        await ok(h.as(ADMIN).commit(archiveNotice({ actorUid: 'admin1', auditId: nextId('na-'), noticeId: 'n-arc' })));
+        expect((await h.peek('notices/n-arc'))?.status).toBe('ARCHIVED');
       });
     });
 

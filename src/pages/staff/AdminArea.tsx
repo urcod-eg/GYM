@@ -1,3 +1,5 @@
+import { GenderFilter } from './GenderUI';
+import type { Gender } from '../../domain/gender';
 import { useEffect, useMemo, useState } from 'react';
 import { DateTime } from 'luxon';
 import { Navigate, Route, Routes } from 'react-router-dom';
@@ -27,6 +29,7 @@ import { BannersPage, PaymentsPage } from './AdminContent';
 import { AttendancePage, useTodayVisits, VipPage } from './Attendance';
 import { CoachesPage } from './Coaching';
 import { FinancePage, ReportsPage } from './Finance';
+import { NoticesPage } from './Notices';
 import { StaffManager } from './StaffManager';
 import { AuditPage } from './AuditPage';
 import { SecurityPage } from './SecurityPage';
@@ -45,6 +48,7 @@ export function AdminArea() {
     { to: '/admin/coaches', label: t('admin.coaches'), icon: 'dumbbell' },
     { to: '/admin/vip', label: t('admin.vip'), icon: 'crown' },
     { to: '/admin/banners', label: t('admin.banners'), icon: 'image' },
+    { to: '/admin/notices', label: t('admin.notices'), icon: 'bell' },
     { to: '/admin/staff', label: t('admin.staff'), icon: 'user' },
     { to: '/admin/security', label: t('admin.security'), icon: 'shield' },
     { to: '/admin/reports', label: t('admin.reports'), icon: 'chart' },
@@ -54,7 +58,7 @@ export function AdminArea() {
   const later: [string, StringKey, number][] = [
   ];
   return (
-    <Shell nav={nav} defaultTheme="light" showCloud title={t('role.admin')} livePaths={['/admin$', '/admin/accounts', '/admin/staff', '/admin/security', '/admin/audit', '/admin/members', '/admin/plans', '/admin/dues', '/admin/settings', '/admin/payments', '/admin/banners', '/admin/attendance', '/admin/vip', '/admin/coaches', '/admin/finance', '/admin/reports']}>
+    <Shell nav={nav} defaultTheme="light" showCloud title={t('role.admin')} livePaths={['/admin$', '/admin/accounts', '/admin/staff', '/admin/security', '/admin/audit', '/admin/members', '/admin/plans', '/admin/dues', '/admin/settings', '/admin/payments', '/admin/banners', '/admin/attendance', '/admin/vip', '/admin/coaches', '/admin/finance', '/admin/reports', '/admin/notices']}>
       <Routes>
         <Route index element={<Dashboard />} />
         <Route path="accounts" element={<AccountsPage admin />} />
@@ -72,6 +76,7 @@ export function AdminArea() {
         <Route path="coaches" element={<CoachesPage />} />
         <Route path="finance" element={<FinancePage />} />
         <Route path="reports" element={<ReportsPage />} />
+        <Route path="notices" element={<NoticesPage />} />
         {later.map(([path, key, phase]) => (
           <Route key={path} path={path} element={<PlaceholderPage title={t(key)} phase={phase} />} />
         ))}
@@ -283,6 +288,7 @@ function Members() {
   const [status, setStatus] = useState<MembershipPhase | 'NONE' | 'ALL'>('ALL');
   const [vip, setVip] = useState<VipTier | 'ALL'>('ALL');
   const [plan, setPlan] = useState<string>('ALL');
+  const [gender, setGender] = useState<Gender | 'ALL'>('ALL');
   const [limit, setLimit] = useState(PAGE);
 
   const filtered = useMemo(
@@ -290,12 +296,13 @@ function Members() {
       searchRows(all, q)
         .filter((r) => status === 'ALL' || r.phase === status)
         .filter((r) => vip === 'ALL' || r.m.vip === vip)
+        .filter((r) => gender === 'ALL' || r.m.gender === gender)
         .filter((r) => plan === 'ALL' || r.m.planId === plan || (!!r.planAr && plans.find((p) => p.id === plan)?.nameAr === r.planAr))
         .sort((a, b) => a.m.name.localeCompare(b.m.name, 'ar')),
-    [all, q, status, vip, plan, plans],
+    [all, q, status, vip, plan, plans, gender],
   );
   const shown = filtered.slice(0, limit);
-  const dirty = q || status !== 'ALL' || vip !== 'ALL' || plan !== 'ALL';
+  const dirty = q || status !== 'ALL' || vip !== 'ALL' || plan !== 'ALL' || gender !== 'ALL';
 
   return (
     <div className="stack">
@@ -337,6 +344,7 @@ function Members() {
             ))}
           </select>
         </div>
+        <GenderFilter value={gender} onChange={setGender} />
         {dirty && (
           <button
             className="linkish"
@@ -346,6 +354,7 @@ function Members() {
               setStatus('ALL');
               setVip('ALL');
               setPlan('ALL');
+              setGender('ALL');
             }}
           >
             {t('app.clear')}

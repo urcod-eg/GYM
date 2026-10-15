@@ -285,7 +285,8 @@ service cloud.firestore {
       let a = me();
       return signedIn() && u != request.auth.uid
         && t.kind == 'staff' && t.status in ['active', 'disabled']
-        && onlyChanges(['roles', 'status', 'displayName', 'updatedAt', 'lastAuditId'])
+        && onlyChanges(['roles', 'status', 'displayName', 'gender', 'updatedAt', 'lastAuditId'])
+        && d.get('gender', null) in [null, 'M', 'F']
         && d.status in ['active', 'disabled', 'removed']
         && d.roles is list && d.roles.size() > 0
         && d.displayName is string && d.displayName.size() >= 2 && d.displayName.size() <= 80
@@ -397,13 +398,26 @@ service cloud.firestore {
         : ('authUid' in k || 'lastInviteId' in k || 'accountStatus' in k) ? memberLinkedByInvite(m)
         : 'vipTierId' in k ? memberVip(m)
         : ('assignedCoachId' in k || 'assignedCoachName' in k) ? memberCoach(m)
+        : 'gender' in k ? memberGender(m)
         // nothing but the stamp changes (e.g. the same tier saved again)
         : (memberVip(m) || memberCoach(m) || memberBlocks(m));
+    }
+    // Men / ladies on a member file (front desk).
+    function memberGender(m) {
+      let d = request.resource.data;
+      return frontDeskWriter()
+        && onlyChanges(['gender', 'updatedAt', 'lastAuditId'])
+        && d.gender in ['M', 'F']
+        && d.updatedAt == request.time
+        && freshAudit('member.gender', 'members', m);
     }
     function newMember(m) {
       let d = request.resource.data;
       let no = d.memberNo;
-      return exactKeys(['memberNo', 'memberCode', 'fullName', 'phoneE164', 'authUid', 'accountStatus', 'assignedCoachId', 'vipTierId', 'blocks', 'searchTokens', 'lastInviteId', 'createdAt', 'createdBy', 'updatedAt', 'lastAuditId'])
+      // gender (men / ladies) is optional: files from before it existed have none
+      return d.keys().hasOnly(['memberNo', 'memberCode', 'fullName', 'phoneE164', 'authUid', 'accountStatus', 'assignedCoachId', 'gender', 'vipTierId', 'blocks', 'searchTokens', 'lastInviteId', 'createdAt', 'createdBy', 'updatedAt', 'lastAuditId'])
+        && d.keys().hasAll(['memberNo', 'memberCode', 'fullName', 'phoneE164', 'authUid', 'accountStatus', 'assignedCoachId', 'vipTierId', 'blocks', 'searchTokens', 'lastInviteId', 'createdAt', 'createdBy', 'updatedAt', 'lastAuditId'])
+        && d.get('gender', null) in [null, 'M', 'F']
         && no is int
         // The counter rule (counterBump) checks the number against the stored counter; here we only
         // check that the counter moves to this member in the same write.
@@ -519,7 +533,9 @@ service cloud.firestore {
     }
     function settingsShape() {
       let d = request.resource.data;
-      return exactKeys(['depositEnabled', 'depositMinPercent', 'depositGraceDays', 'depositMaxGraceDays', 'cashierMaxDiscount', 'updatedAt', 'lastAuditId'])
+      return exactKeys(['depositEnabled', 'depositMinPercent', 'depositGraceDays', 'depositMaxGraceDays', 'cashierMaxDiscount', 'genderMode', 'ladiesHours', 'updatedAt', 'lastAuditId'])
+        && d.genderMode in ['MIXED', 'SPLIT_HOURS', 'SEPARATE']
+        && d.ladiesHours is map && d.ladiesHours.keys().hasOnly(['0', '1', '2', '3', '4', '5', '6'])
         && d.depositEnabled is bool
         && d.depositMinPercent is int && d.depositMinPercent >= 10 && d.depositMinPercent <= 90
         && d.depositGraceDays is int && d.depositGraceDays >= 1 && d.depositGraceDays <= 60
@@ -528,6 +544,18 @@ service cloud.firestore {
         && d.updatedAt == request.time;
     }
     function settings() { return get(settingsPath()).data; }
+    // The gym's men / ladies setup (no settings saved yet = one mixed gym).
+    function genderModeIs(mode) { return exists(settingsPath()) && settings().get('genderMode', 'MIXED') == mode; }
+    // Ladies' hours: hours of the day (Cairo time) per weekday ('0' = Sunday). Egypt is UTC+2 in winter and
+    // UTC+3 in summer; the rules accept either, the app decides with the exact clock.
+    function ladiesHourAt(s, offsetHours) {
+      let t = request.time + duration.value(offsetHours, 'h');
+      return t.hours() in s.ladiesHours.get(string(t.dayOfWeek() % 7), []);
+    }
+    function sectionOk(g) {
+      return !genderModeIs('SPLIT_HOURS')
+        || (g in ['M', 'F'] && (ladiesHourAt(settings(), 2) == (g == 'F') || ladiesHourAt(settings(), 3) == (g == 'F')));
+    }
 
     // ---------------------------------------------------------------- memberships
     match /memberships/{id} {
@@ -763,6 +791,7 @@ service cloud.firestore {
         && d.by == request.auth.uid && d.at == request.time
         && c != null && coversNow(c) && d.membershipId == c.id
         && !blockedNow(m.blocks, 'CHECKIN_BLOCK') && !blockedNow(m.blocks, 'TEMPORARY_SUSPENSION')
+        && sectionOk(m.get('gender', null))
         && (bal == null || request.time < bal.dueAt || (bal.graceUntil != null && request.time < bal.graceUntil))
         && (last == null || request.time > last + duration.value(2, 'm'))
         && ((d.method == 'MANUAL' && d.code == null)
@@ -860,7 +889,10 @@ service cloud.firestore {
       return adminWriter()
         && onlyChanges(['assignedCoachId', 'assignedCoachName', 'updatedAt', 'lastAuditId'])
         && ((d.assignedCoachId == null && d.assignedCoachName == null)
-            || (d.assignedCoachId is string && coachAccount(d.assignedCoachId, d.assignedCoachName)))
+            || (d.assignedCoachId is string && coachAccount(d.assignedCoachId, d.assignedCoachName)
+                // a separate ladies' section: the coach is of the member's section
+                && (!genderModeIs('SEPARATE') || (resource.data.get('gender', null) in ['M', 'F']
+                    && get(userPath(d.assignedCoachId)).data.get('gender', null) == resource.data.get('gender', null)))))
         && d.updatedAt == request.time
         && freshAudit('member.coach', 'members', m);
     }
@@ -931,6 +963,59 @@ service cloud.firestore {
         && (d.endsAt == null || d.endsAt is timestamp)
         && d.updatedAt == request.time;
     }
+    // ================================================================ in-app notices (admin → members)
+    // Everyone / active / VIP notices are public to signed-in members (the app shows each member theirs);
+    // a notice to chosen members is not public and reaches each of them as an inbox copy only they read.
+    function noticePath(n) { return /databases/$(database)/documents/notices/$(n); }
+    match /notices/{n} {
+      allow read: if (active() && resource.data.public == true) || isAdmin();
+      allow create: if adminWriter() && noticeShape(n) && freshAudit('notice.send', 'notices', n);
+      allow update: if adminWriter()
+        && resource.data.status == 'PUBLISHED' && request.resource.data.status == 'ARCHIVED'
+        && onlyChanges(['status', 'updatedAt', 'lastAuditId'])
+        && request.resource.data.updatedAt == request.time
+        && freshAudit('notice.archive', 'notices', n);
+    }
+    function noticeShape(n) {
+      let d = request.resource.data;
+      return n.matches('^[A-Za-z0-9_-]{2,40}$')
+        && exactKeys(['title', 'body', 'audience', 'public', 'recipients', 'status', 'by', 'at', 'updatedAt', 'lastAuditId'])
+        && d.title is string && d.title.size() >= 2 && d.title.size() <= 60
+        && d.body is string && d.body.size() >= 1 && d.body.size() <= 500
+        && d.audience in ['ALL', 'ACTIVE', 'VIP', 'MEN', 'LADIES', 'LIST']
+        && d.public == (d.audience != 'LIST')
+        && d.recipients is int
+        && (d.audience == 'LIST' ? (d.recipients >= 1 && d.recipients <= 200) : d.recipients == 0)
+        && d.status == 'PUBLISHED'
+        && d.by == request.auth.uid && d.at == request.time && d.updatedAt == request.time;
+    }
+    match /inbox/{id} {
+      allow read: if isAdmin() || isMemberSelf(resource.data.memberId);
+      allow create: if adminWriter() && inboxOk(id);
+      allow delete: if devWipe();
+    }
+    function inboxOk(id) {
+      let d = request.resource.data;
+      let n = getAfter(noticePath(d.noticeId)).data;
+      return exactKeys(['noticeId', 'memberId', 'title', 'body', 'by', 'at'])
+        && d.noticeId is string && d.memberId is string && id == d.noticeId + '_' + d.memberId
+        && n.audience == 'LIST' && n.status == 'PUBLISHED' && n.by == request.auth.uid
+        && d.title == n.title && d.body == n.body
+        && d.by == request.auth.uid && d.at == request.time
+        && exists(memberPath(d.memberId));
+    }
+    // The member pressed "OK" on a notice: once, by that member only; the admin counts them.
+    match /noticeReads/{id} {
+      allow read: if isAdmin() || isMemberSelf(resource.data.memberId);
+      allow create: if isMemberSelf(request.resource.data.memberId)
+        && exactKeys(['noticeId', 'memberId', 'at'])
+        && request.resource.data.noticeId is string
+        && id == request.resource.data.noticeId + '_' + request.resource.data.memberId
+        && request.resource.data.at == request.time
+        && exists(noticePath(request.resource.data.noticeId));
+      allow delete: if devWipe();
+    }
+
     match /vipTiers/{v} {
       allow read: if active();
       allow create, update: if v in ['PLUS', 'ELITE'] && adminWriter()
@@ -960,7 +1045,7 @@ service cloud.firestore {
         // the described document, changed in this same write, points back at this entry (each of those
         // documents has its own rules, so an entry can only describe a change that was allowed)
         && d.entityType in ['members', 'users', 'license', 'gymPublicConfig', 'pinSecrets', 'wipes', 'plans', 'gymSettings',
-                            'memberships', 'banners', 'vipTiers', 'financeEntries', 'cashCloses', 'exercises']
+                            'memberships', 'banners', 'vipTiers', 'financeEntries', 'cashCloses', 'exercises', 'notices']
         && getAfter(/databases/$(database)/documents/$(d.entityType)/$(d.entityId)).data.lastAuditId == aid;
     }
 

@@ -1,3 +1,5 @@
+import { GenderPicker, useGenderMode } from './GenderUI';
+import type { Gender } from '../../domain/gender';
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { useApp } from '../../app/AppContext';
 import { useGym } from '../../app/GymContext';
@@ -222,6 +224,8 @@ function RegisterModal({ onClose, existing }: { onClose: () => void; existing: M
   const errText = useErrorText();
   const [name, setName] = useState('');
   const [phone, setPhone] = useState('');
+  const { mode: genderMode } = useGenderMode();
+  const [gender, setGender] = useState<Gender | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   // One id per form: a retry after a dropped connection finds the first attempt instead of registering twice.
@@ -237,12 +241,13 @@ function RegisterModal({ onClose, existing }: { onClose: () => void; existing: M
     if (name.trim().length < 2) return setErr(t('err.invalid-name'));
     if (!e164) return setErr(t('err.invalid-phone'));
     if (dupe) return setErr(t('reg.phoneExists', { name: dupe.fullName, code: dupe.memberCode }));
+    if (genderMode !== 'MIXED' && !gender) return setErr(t('gender.required'));
     if (demoMode) return toast(t('app.demoNoSave'));
     setBusy(true);
     try {
       const id = memberId ?? (await data.newMemberId());
       setMemberId(id);
-      const r = await data.registerMember(actor, { memberId: id, fullName: name, phone });
+      const r = await data.registerMember(actor, { memberId: id, fullName: name, phone, gender });
       if (r.existing) return setErr(t('err.phone-registered'));
       toast(t('acc.registered', { name: name.trim(), code: r.memberCode }), 'success');
       setDone({ id, memberNo: 0, memberCode: r.memberCode, fullName: name.trim(), phoneE164: e164, authUid: null, accountStatus: 'PENDING_ACTIVATION', assignedCoachId: null, blocks: {}, searchTokens: [], createdAt: null });
@@ -267,6 +272,7 @@ function RegisterModal({ onClose, existing }: { onClose: () => void; existing: M
           <input id="rp" className="input ltr" inputMode="tel" value={phone} onChange={(e) => setPhone(e.target.value)} placeholder="010 1234 5678" style={{ textAlign: 'start' }} />
           {dupe && <span className="error">{t('reg.phoneExists', { name: dupe.fullName, code: dupe.memberCode })}</span>}
         </div>
+        {genderMode !== 'MIXED' && <GenderPicker value={gender} onChange={setGender} id="acc-g" required />}
         {err && <span className="error" role="alert">{err}</span>}
         <button className="btn btn-primary btn-lg btn-block" disabled={busy} aria-busy={busy}>
           {t('acc.save')}

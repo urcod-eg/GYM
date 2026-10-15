@@ -1,3 +1,5 @@
+import { useGenderMode, GenderBadge, GenderPicker } from './GenderUI';
+import { sectionAt } from '../../domain/gender';
 import { playDoorSound, setSoundsOn, soundsOn, unlockSounds } from '../../domain/sounds';
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { DateTime } from 'luxon';
@@ -34,6 +36,8 @@ const REASON_KEY: Record<EntryReason, StringKey> = {
   CODE_USED: 'checkin.CODE_USED',
   CODE_EXPIRED: 'checkin.CODE_EXPIRED',
   TOO_SOON: 'checkin.TOO_SOON',
+  NO_GENDER: 'checkin.NO_GENDER',
+  WRONG_HOURS: 'checkin.WRONG_HOURS',
 };
 
 interface Outcome {
@@ -45,7 +49,7 @@ interface Outcome {
 
 /** Live check-in at the door: camera QR scan (code refreshes every 45 s) or the member number typed in. */
 export function LiveScan() {
-  const { t, lang, fmtDate, fmtTime } = useApp();
+  const { t, lang, fmtDate, fmtTime, toast } = useApp();
   const actor = useActor();
   const errText = useErrorText();
   const rows = useLedger().rows ?? [];
@@ -56,13 +60,15 @@ export function LiveScan() {
   const [camOn, setCamOn] = useState(false);
   const [picks, setPicks] = useState<typeof rows>([]);
   const [sound, setSound] = useState(soundsOn);
+  const gm = useGenderMode();
+  const nowSection = sectionAt(gm.mode, gm.hours, new Date());
   const lastText = useRef<{ text: string; at: number } | null>(null);
 
   const run = async (memberId: string, method: 'QR' | 'MANUAL', qrCode: string | null) => {
     setBusy(true);
     setErr(null);
     try {
-      const r = await data.checkInMember(actor, memberId, method, qrCode);
+      const r = await data.checkInMember(actor, memberId, method, qrCode, { genderMode: gm.mode, ladiesHours: gm.hours });
       setOutcome({ ...r, at: new Date() });
       playDoorSound(r.done ? 'ok' : 'no');
     } catch (e) {
@@ -115,6 +121,7 @@ export function LiveScan() {
     <div className="grid-2" style={{ alignItems: 'start' }}>
       <section className="stack">
         <h1 className="page-title">{t('scan.title')}</h1>
+        {nowSection && <span className={`badge no-dot ${nowSection === 'F' ? 'badge-ladies' : 'badge-neutral'}`} style={{ alignSelf: 'flex-start' }}>{t(nowSection === 'F' ? 'gender.ladiesNow' : 'gender.menNow')}</span>}
         {camOn ? (
           <Camera onText={onQr} onError={(e) => { setErr(e); setCamOn(false); }} />
         ) : (
@@ -191,6 +198,7 @@ export function LiveScan() {
                 <div className="row wrap" style={{ gap: 6 }}>
                   <strong style={{ fontSize: '1.25rem' }}>{m.fullName}</strong>
                   {m.vipTierId && <VipBadge tier={m.vipTierId} />}
+                  {gm.mode !== 'MIXED' && <GenderBadge g={m.gender} />}
                 </div>
                 <span className="muted small ltr">{m.memberCode}</span>
               </div>
@@ -221,6 +229,21 @@ export function LiveScan() {
               <Icon name="refresh" />
               {t('scan.openRenew')}
             </Link>
+          )}
+          {!outcome.done && m && c.reason === 'NO_GENDER' && (
+            <GenderPicker
+              value={null}
+              id="scan-g"
+              onChange={async (g) => {
+                try {
+                  await data.setMemberGender(actor, m.id, g);
+                  toast(t('gender.saved'), 'success');
+                  await run(m.id, 'MANUAL', null);
+                } catch (e) {
+                  setErr(errText(e));
+                }
+              }}
+            />
           )}
         </section>
       )}

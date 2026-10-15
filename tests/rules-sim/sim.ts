@@ -701,6 +701,10 @@ function method(o: RV, name: string, args: RV[]): RV {
     }
   }
   if (o instanceof RTime && name === 'toMillis') return o.ms;
+  // Timestamp parts are in UTC, as in the real runtime; dayOfWeek: 1 = Monday … 7 = Sunday.
+  if (o instanceof RTime && name === 'hours') return new Date(o.ms).getUTCHours();
+  if (o instanceof RTime && name === 'minutes') return new Date(o.ms).getUTCMinutes();
+  if (o instanceof RTime && name === 'dayOfWeek') return new Date(o.ms).getUTCDay() || 7;
   // The real runtime's hex case is not documented; the rules lower-case it before comparing.
   if (o instanceof RBytes && name === 'toHexString') return o.buf.toString('hex').toUpperCase();
   if (o instanceof RBytes && name === 'toBase64') return o.buf.toString('base64');

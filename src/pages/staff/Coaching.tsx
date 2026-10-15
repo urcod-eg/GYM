@@ -1,3 +1,5 @@
+import { genderKey, useGenderMode } from './GenderUI';
+import { coachAllowed } from '../../domain/gender';
 import { useEffect, useMemo, useState } from 'react';
 import { DateTime } from 'luxon';
 import { useApp } from '../../app/AppContext';
@@ -513,11 +515,11 @@ export function CoachesPage() {
   const rows = useLedger().rows ?? [];
   const coaches = (staff ?? []).filter((s) => s.roles.includes('coach') && s.status === 'active');
   const demoCoaches = [
-    { uid: 'c1', displayName: 'كابتن محمد سامي' },
-    { uid: 'c2', displayName: 'كابتن ندى فاروق' },
-    { uid: 'c3', displayName: 'كابتن عمر حسن' },
+    { uid: 'c1', displayName: 'كابتن محمد سامي', gender: 'M' as const },
+    { uid: 'c2', displayName: 'كابتن ندى فاروق', gender: 'F' as const },
+    { uid: 'c3', displayName: 'كابتن عمر حسن', gender: 'M' as const },
   ];
-  const list = demoMode ? demoCoaches : coaches.map((c) => ({ uid: c.uid, displayName: c.displayName }));
+  const list: CoachOption[] = demoMode ? demoCoaches : coaches.map((c) => ({ uid: c.uid, displayName: c.displayName, gender: c.gender ?? null }));
   const [assigning, setAssigning] = useState(false);
   const [openPlan, setOpenPlan] = useState<MemberRow | null>(null);
   const unassigned = rows.filter((r) => !r.m.coachId && r.phase !== 'NONE').length;
@@ -578,21 +580,30 @@ export function CoachesPage() {
   );
 }
 
-function AssignCoach({ coaches, onPick, onClose }: { coaches: { uid: string; displayName: string }[]; onPick: (memberId: string, coach: { uid: string; name: string }) => void; onClose: () => void }) {
+type CoachOption = { uid: string; displayName: string; gender: 'M' | 'F' | null };
+
+function AssignCoach({ coaches, onPick, onClose }: { coaches: CoachOption[]; onPick: (memberId: string, coach: { uid: string; name: string }) => void; onClose: () => void }) {
   const { t } = useApp();
   const rows = useLedger().rows ?? [];
+  const { mode } = useGenderMode();
   const [coach, setCoach] = useState(coaches[0]?.uid ?? '');
   const [q, setQ] = useState('');
-  const found = q.trim() ? searchRows(rows, q).slice(0, 8) : rows.filter((r) => !r.m.coachId && r.phase !== 'NONE').slice(0, 8);
   const c = coaches.find((x) => x.uid === coach);
+  // A separate ladies' section: only members of the coach's own section.
+  const sameSection = (r: MemberRow) => coachAllowed(mode, r.m.gender, c?.gender);
+  const found = (q.trim() ? searchRows(rows, q) : rows.filter((r) => !r.m.coachId && r.phase !== 'NONE')).filter(sameSection).slice(0, 8);
   return (
     <Modal open onClose={onClose} title={t('coachAdmin.assign')}>
       <div className="stack">
         <select className="select" value={coach} onChange={(e) => setCoach(e.target.value)} aria-label={t('member.coach')}>
           {coaches.map((x) => (
-            <option key={x.uid} value={x.uid}>{x.displayName}</option>
+            <option key={x.uid} value={x.uid}>
+              {x.displayName}
+              {mode === 'SEPARATE' ? ` · ${t(genderKey(x.gender))}` : ''}
+            </option>
           ))}
         </select>
+        {mode === 'SEPARATE' && <span className="hint">{c && !c.gender ? t('gender.staffHint') : t('gender.coachSame')}</span>}
         <input className="input" placeholder={t('cashier.searchPh')} value={q} onChange={(e) => setQ(e.target.value)} />
         {found.map((r) => (
           <button key={r.m.id} className="list-item" disabled={!c} onClick={() => c && onPick(r.m.id, { uid: c.uid, name: c.displayName })}>

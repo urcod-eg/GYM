@@ -8,6 +8,7 @@
  * [startsAt, endsAt) in the gym timezone, a balance is late from `dueAt` (00:00 the day after the
  * due date), an entry permission lasts until `graceUntil` (00:00 the day after its last day).
  */
+import { GENDER_MODES, validLadiesHours, type GenderMode, type LadiesHours } from './gender';
 import { DateTime } from 'luxon';
 import { computeEndExclusive, GYM_TZ, localStartOfDay, type PlanDuration } from './dates';
 import { CUSTOM_DAYS_MAX, CUSTOM_DAYS_MIN, type Plan } from './plans';
@@ -100,6 +101,9 @@ export interface GymSettingsDoc {
   depositGraceDays: number; // 1..60, default due date for the remainder
   depositMaxGraceDays: number; // graceDays..60, latest due date a cashier may pick
   cashierMaxDiscount: number; // 0..100, the most a cashier may discount (admins: any)
+  /** Men / ladies setup (see gender.ts). */
+  genderMode: GenderMode;
+  ladiesHours: LadiesHours;
 }
 
 export const DEFAULT_GYM_SETTINGS: GymSettingsDoc = {
@@ -108,6 +112,8 @@ export const DEFAULT_GYM_SETTINGS: GymSettingsDoc = {
   depositGraceDays: 7,
   depositMaxGraceDays: 30,
   cashierMaxDiscount: 10,
+  genderMode: 'MIXED',
+  ladiesHours: {},
 };
 
 export function validSettings(s: GymSettingsDoc): boolean {
@@ -117,7 +123,9 @@ export function validSettings(s: GymSettingsDoc): boolean {
     int(s.depositMinPercent, 10, 90) &&
     int(s.depositGraceDays, 1, 60) &&
     int(s.depositMaxGraceDays, s.depositGraceDays, 60) &&
-    int(s.cashierMaxDiscount, 0, 100)
+    int(s.cashierMaxDiscount, 0, 100) &&
+    (GENDER_MODES as readonly string[]).includes(s.genderMode) &&
+    validLadiesHours(s.ladiesHours)
   );
 }
 
@@ -130,6 +138,9 @@ export function setGymSettings(i: { actorUid: string; auditId: string; settings:
     depositGraceDays: s.depositGraceDays,
     depositMaxGraceDays: s.depositMaxGraceDays,
     cashierMaxDiscount: s.cashierMaxDiscount,
+    genderMode: s.genderMode,
+    // only days that have ladies' hours, each sorted
+    ladiesHours: Object.fromEntries(Object.entries(s.ladiesHours).filter(([, v]) => v.length).map(([k, v]) => [k, [...v].sort((a, b) => a - b)])),
   };
   return [
     { type: 'set', path: 'gymSettings/main', data: { ...data, updatedAt: SERVER_TIME, lastAuditId: i.auditId } },

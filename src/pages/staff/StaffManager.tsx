@@ -1,3 +1,5 @@
+import { GenderPicker, useGenderMode } from './GenderUI';
+import type { Gender } from '../../domain/gender';
 import { useEffect, useState, type FormEvent } from 'react';
 import { useApp } from '../../app/AppContext';
 import { useGym } from '../../app/GymContext';
@@ -260,6 +262,8 @@ function EditDialog({ s, grantable, actorRoles, onClose }: { s: StaffAccount; gr
   const errText = useErrorText();
   const [roles, setRoles] = useState<string[]>(s.roles);
   const [name, setName] = useState(s.displayName);
+  const [gender, setGender] = useState<Gender | null>(s.gender ?? null);
+  const genderOn = useGenderMode().mode !== 'MIXED';
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const save = async (e: FormEvent) => {
@@ -268,7 +272,7 @@ function EditDialog({ s, grantable, actorRoles, onClose }: { s: StaffAccount; gr
     if (demoMode) return toast(t('app.demoNoSave'));
     setBusy(true);
     try {
-      await data.updateStaffAccount({ ...actor, roles: actorRoles }, s, { roles, ...(name.trim() !== s.displayName ? { displayName: name } : {}) });
+      await data.updateStaffAccount({ ...actor, roles: actorRoles }, s, { roles, ...(name.trim() !== s.displayName ? { displayName: name } : {}), ...(gender && gender !== s.gender ? { gender } : {}) });
       toast(t('staff.saved'), 'success');
       onClose();
     } catch (ex) {
@@ -286,6 +290,12 @@ function EditDialog({ s, grantable, actorRoles, onClose }: { s: StaffAccount; gr
         </div>
         <span className="label">{t('staff.roles')}</span>
         <RoleChips grantable={grantable} value={roles} onChange={setRoles} />
+        {genderOn && (
+          <>
+            <GenderPicker value={gender} onChange={setGender} id="st-g" />
+            <span className="hint">{t('gender.staffHint')}</span>
+          </>
+        )}
         {err && <span className="error" role="alert">{err}</span>}
         <button className="btn btn-primary" disabled={busy} aria-busy={busy}>{t('app.save')}</button>
       </form>

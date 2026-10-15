@@ -8,6 +8,7 @@
  * it), a code that is fresh (90 s, by server time) and unused, and not the same member twice in 2 min.
  * A screenshot of the code is useless after it is scanned once or after 90 seconds.
  */
+import { sectionRefusal, type GenderMode, type LadiesHours } from './gender';
 import { SERVER_TIME, type AnyOp, type WriteOp } from './writes';
 import type { BalanceDoc, MembershipSummary } from './sales';
 
@@ -46,6 +47,7 @@ export interface EntryMember {
   balance: BalanceDoc | null | undefined;
   blocks: Record<string, { until?: Date | null } | undefined>;
   lastCheckInAt: Date | null | undefined;
+  gender?: 'M' | 'F' | null;
 }
 
 export type EntryReason =
@@ -59,7 +61,9 @@ export type EntryReason =
   | 'CODE_INVALID'
   | 'CODE_USED'
   | 'CODE_EXPIRED'
-  | 'TOO_SOON';
+  | 'TOO_SOON'
+  | 'NO_GENDER'
+  | 'WRONG_HOURS';
 
 export interface EntryCheck {
   allowed: boolean;
@@ -74,7 +78,7 @@ export interface EntryCheck {
 const blockedNow = (b: { until?: Date | null } | undefined, now: Date) => !!b && (b.until == null || b.until > now);
 
 /** Exactly what the rules check (same order of importance for the message shown). */
-export function checkEntry(m: EntryMember, now: Date, token: { code: string; doc: TokenDoc | null } | null): EntryCheck {
+export function checkEntry(m: EntryMember, now: Date, token: { code: string; doc: TokenDoc | null } | null, gym?: { genderMode: GenderMode; ladiesHours: LadiesHours }): EntryCheck {
   const deny = (reason: EntryReason): EntryCheck => ({ allowed: false, reason, counts: false, visitsLeft: null, note: null });
   const c = m.membership;
   if (!c) return deny('NO_MEMBERSHIP');
@@ -88,6 +92,9 @@ export function checkEntry(m: EntryMember, now: Date, token: { code: string; doc
   const counts = mainCovers && c.visitQuota != null;
   if (counts && (c.visitsUsed ?? 0) >= (c.visitQuota ?? 0)) return deny('QUOTA_USED');
   if (blockedNow(m.blocks?.CHECKIN_BLOCK, now) || blockedNow(m.blocks?.TEMPORARY_SUSPENSION, now)) return deny('BLOCKED');
+  // Ladies' hours: only ladies then, only men otherwise.
+  const section = gym ? sectionRefusal(gym.genderMode, gym.ladiesHours, m.gender, now) : null;
+  if (section) return deny(section);
   const b = m.balance;
   let note: EntryCheck['note'] = null;
   if (b && b.remaining > 0) {

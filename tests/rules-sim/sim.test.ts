@@ -42,6 +42,11 @@ describe('rules simulator semantics', () => {
     expect(await allowed("resource.data.diff({'a': 2, 's': 'abc', 'm': {'k': 'v'}, 'l': ['x','y']}).affectedKeys().hasOnly(['a'])")).toBe(true);
     expect(await allowed("resource.data.keys().hasAll(['a','s']) && resource.data.size() == 4")).toBe(true);
   });
+  it('timestamp parts are UTC; dayOfWeek runs 1 (Monday) to 7 (Sunday)', async () => {
+    const d = new Date();
+    const dow = d.getUTCDay() || 7;
+    expect(await allowed(`request.time.dayOfWeek() == ${dow} && request.time.hours() == ${d.getUTCHours()}`)).toBe(true);
+  });
   it('time arithmetic and types', async () => {
     expect(await allowed("request.time + duration.value(1, 'h') > request.time && request.time is timestamp && resource.data.a is int")).toBe(true);
     expect(await allowed("resource.data.s + 1 == 'abc1'")).toBe(false);

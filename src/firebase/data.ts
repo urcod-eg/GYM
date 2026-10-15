@@ -12,6 +12,8 @@ import * as C from '../domain/content';
 import * as A from '../domain/attendance';
 import * as K from '../domain/coaching';
 import * as F from '../domain/finance';
+import * as N from '../domain/notices';
+import type { GenderMode, LadiesHours } from '../domain/gender';
 import { aliasId, hashPin, inviteIdOf, isInviteCode, newInviteCode, newLoginEmail, newPassword, newPin, newSalt, passwordProblem, type PersonKind } from '../domain/identity';
 import { normalizeEgyptPhone } from '../domain/text';
 
@@ -76,6 +78,7 @@ export interface MemberDoc {
   vipTierId?: 'PLUS' | 'ELITE' | null;
   lastCheckInAt?: Date | null;
   assignedCoachName?: string | null;
+  gender?: 'M' | 'F' | null;
 }
 
 /** The signed-in member's own file. `blocked` when the rules refuse (login block or suspension). */
@@ -345,7 +348,7 @@ export async function setRemember(remember: boolean) {
  * Registers a member file (no membership or payment yet — those come in Phase 3).
  * `memberId` is chosen once per form, so a retry after a dropped connection cannot register twice.
  */
-export async function registerMember(actor: Actor, input: { memberId: string; fullName: string; phone: string; assignedCoachId?: string | null }) {
+export async function registerMember(actor: Actor, input: { memberId: string; fullName: string; phone: string; assignedCoachId?: string | null; gender?: 'M' | 'F' | null }) {
   const phone = normalizeEgyptPhone(input.phone) ?? failWith('invalid-phone');
   const auditId = await newId();
   const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
@@ -361,6 +364,7 @@ export async function registerMember(actor: Actor, input: { memberId: string; fu
       fullName: input.fullName,
       phone,
       assignedCoachId: input.assignedCoachId ?? null,
+      gender: input.gender ?? null,
       codePrefix: cfg.exists() ? (cfg.data().codePrefix as string) : null,
       counter: ctr.exists() ? { next: ctr.data().next as number } : null,
       phoneOwner: null,
@@ -401,6 +405,7 @@ export interface StaffAccount {
   status: 'active' | 'disabled' | 'replaced' | 'removed';
   displayName: string;
   phone: string;
+  gender?: 'M' | 'F' | null;
 }
 
 export async function watchStaff(cb: (rows: StaffAccount[]) => void, onError: (e: unknown) => void): Promise<Unsubscribe> {
@@ -409,7 +414,7 @@ export async function watchStaff(cb: (rows: StaffAccount[]) => void, onError: (e
   return fs.onSnapshot(q, (s) => cb(s.docs.map((d) => ({ ...fromSdk<Omit<StaffAccount, 'uid'>>(d.data()), uid: d.id }) as StaffAccount).filter((x) => x.status !== 'replaced' && x.status !== 'removed')), onError);
 }
 
-export async function updateStaffAccount(actor: Actor, target: StaffAccount, change: { roles?: string[]; status?: 'active' | 'disabled'; displayName?: string }) {
+export async function updateStaffAccount(actor: Actor, target: StaffAccount, change: { roles?: string[]; status?: 'active' | 'disabled'; displayName?: string; gender?: 'M' | 'F' }) {
   const [{ db }, auditId] = await Promise.all([firebase(), newId()]);
   await commitOps(db, W.updateStaff({ actorUid: actor.uid, actorRoles: actor.roles, auditId, target, ...change }));
 }
@@ -432,7 +437,12 @@ export async function wipeMemberData(actor: Actor, devValue: string, onProgress?
     fs.getDocs(fs.collection(db, 'memberships')),
     fs.getDocs(fs.collection(db, 'payments')),
   ]);
-  const [checkins, tokens] = await Promise.all([fs.getDocs(fs.collection(db, 'checkins')), fs.getDocs(fs.collection(db, 'checkinTokens'))]);
+  const [checkins, tokens, inbox, reads] = await Promise.all([
+    fs.getDocs(fs.collection(db, 'checkins')),
+    fs.getDocs(fs.collection(db, 'checkinTokens')),
+    fs.getDocs(fs.collection(db, 'inbox')),
+    fs.getDocs(fs.collection(db, 'noticeReads')),
+  ]);
   const counts: W.WipeCounts = { members: members.size, accounts: users.size, invites: invites.size, memberships: memberships.size, payments: payments.size };
   const [wipeId, auditId] = [fs.doc(fs.collection(db, 'wipes')).id, await newId()];
   await commitOps(db, W.wipeRecord({ actorUid: actor.uid, auditId, wipeId, counts }));
@@ -445,6 +455,8 @@ export async function wipeMemberData(actor: Actor, devValue: string, onProgress?
     extraPaths: [
       ...checkins.docs.map((d) => `checkins/${d.id}`),
       ...tokens.docs.map((d) => `checkinTokens/${d.id}`),
+      ...inbox.docs.map((d) => `inbox/${d.id}`),
+      ...reads.docs.map((d) => `noticeReads/${d.id}`),
       // One document per member in each of these (id = member id).
       ...members.docs.flatMap((d) => ['workoutPlans', 'nutritionPlans', 'workoutLogs', 'bodyLogs'].map((c) => `${c}/${d.id}`)),
     ],
@@ -490,7 +502,7 @@ export async function savePlan(actor: Actor, planId: string, plan: S.PlanDoc) {
 /** Gym settings; `null` until an admin saves them once (the defaults apply meanwhile). */
 export async function watchSettings(cb: (s: S.GymSettingsDoc | null) => void, onError: (e: unknown) => void): Promise<Unsubscribe> {
   const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
-  return fs.onSnapshot(fs.doc(db, 'gymSettings', 'main'), (s) => cb(s.exists() ? fromSdk<S.GymSettingsDoc>(s.data()) : null), onError);
+  return fs.onSnapshot(fs.doc(db, 'gymSettings', 'main'), (s) => cb(s.exists() ? { ...S.DEFAULT_GYM_SETTINGS, ...fromSdk<Partial<S.GymSettingsDoc>>(s.data()) } : null), onError);
 }
 
 export async function saveSettings(actor: Actor, settings: S.GymSettingsDoc) {
@@ -629,7 +641,7 @@ export interface CheckinResult {
  * from the local cache), shows why entry is refused, and writes the check-in when it is allowed.
  * The rules make the same decision again, so a modified browser cannot let anyone in.
  */
-export async function checkInMember(actor: Actor, memberId: string, method: 'QR' | 'MANUAL', code: string | null): Promise<CheckinResult> {
+export async function checkInMember(actor: Actor, memberId: string, method: 'QR' | 'MANUAL', code: string | null, gym?: { genderMode: GenderMode; ladiesHours: LadiesHours }): Promise<CheckinResult> {
   const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
   const [ms, ts] = await Promise.all([
     fs.getDocFromServer(fs.doc(db, 'members', memberId)),
@@ -639,7 +651,7 @@ export async function checkInMember(actor: Actor, memberId: string, method: 'QR'
   const member = { ...fromSdk<Omit<MemberDoc, 'id'>>(ms.data()), id: ms.id } as MemberDoc;
   const token = method === 'QR' ? { code: code ?? '', doc: ts && ts.exists() ? fromSdk<A.TokenDoc>(ts.data()) : null } : null;
   // The server's clock decides; this local check only explains a refusal.
-  const check = A.checkEntry({ id: member.id, membership: member.membership, balance: member.balance, blocks: member.blocks, lastCheckInAt: member.lastCheckInAt }, new Date(), token);
+  const check = A.checkEntry({ id: member.id, membership: member.membership, balance: member.balance, blocks: member.blocks, lastCheckInAt: member.lastCheckInAt, gender: member.gender ?? null }, new Date(), token, gym);
   if (!check.allowed) return { check, member, done: false };
   const checkinId = fs.doc(fs.collection(db, 'checkins')).id;
   await commitOps(db, A.checkIn({ actorUid: actor.uid, checkinId, member: { id: member.id, membership: member.membership, balance: member.balance, blocks: member.blocks, lastCheckInAt: member.lastCheckInAt }, method, code, counts: check.counts }));
@@ -908,4 +920,91 @@ export function reasonOf(e: unknown): string {
   if (e instanceof AppFailure || e instanceof W.WriteError) return REASON_ALIASES[e.reason] ?? e.reason;
   const code = (e as { code?: string })?.code ?? '';
   return REASON_ALIASES[code] ?? REASON_ALIASES[code.replace(/^firestore\//, '')] ?? 'unknown';
+}
+
+// ------------------------------------------------------------------ in-app notices
+
+export type NoticeRow = N.NoticeDoc & { id: string };
+export interface InboxRow {
+  id: string;
+  noticeId: string;
+  title: string;
+  body: string;
+  at: Date | null;
+}
+
+/** Admin: every notice. Members: the public ones (audience filtered in the app). */
+export async function watchNotices(all: boolean, cb: (rows: NoticeRow[]) => void, onError: (e: unknown) => void): Promise<Unsubscribe> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const col = fs.collection(db, 'notices');
+  const q = all ? col : fs.query(col, fs.where('public', '==', true));
+  return fs.onSnapshot(q, (s) => cb(s.docs.map((d) => ({ ...fromSdk<N.NoticeDoc>(d.data()), id: d.id })).sort((a, b) => (b.at?.getTime() ?? 0) - (a.at?.getTime() ?? 0))), onError);
+}
+
+/** A member's own copies of notices sent to chosen members, and the notices they already read. */
+export async function watchMyNotices(memberId: string, cb: (inbox: InboxRow[], readIds: Set<string>) => void, onError: (e: unknown) => void): Promise<Unsubscribe> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  let inbox: InboxRow[] | null = null;
+  let reads: Set<string> | null = null;
+  const emit = () => inbox && reads && cb(inbox, reads);
+  const u1 = fs.onSnapshot(fs.query(fs.collection(db, 'inbox'), fs.where('memberId', '==', memberId)), (s) => {
+    inbox = s.docs.map((d) => ({ ...fromSdk<Omit<InboxRow, 'id'>>(d.data()), id: d.id }));
+    emit();
+  }, onError);
+  const u2 = fs.onSnapshot(fs.query(fs.collection(db, 'noticeReads'), fs.where('memberId', '==', memberId)), (s) => {
+    reads = new Set(s.docs.map((d) => String(d.data().noticeId)));
+    emit();
+  }, onError);
+  return () => {
+    u1();
+    u2();
+  };
+}
+
+export async function markNoticeRead(memberId: string, noticeId: string) {
+  const { db } = await firebase();
+  await commitOps(db, N.readNotice({ noticeId, memberId }));
+}
+
+/** Sends a notice; to chosen members it also writes one copy each, in small writes. */
+export async function sendNotice(actor: Actor, input: N.NoticeInput, onProgress?: (done: number, total: number) => void) {
+  const [{ db }, auditId, noticeId] = await Promise.all([firebase(), newId(), docId('notices')]);
+  const r = N.sendNotice({ actorUid: actor.uid, auditId, noticeId, input });
+  await commitOps(db, r.first);
+  let done = 0;
+  const total = r.rest.reduce((s, c) => s + c.length, 0);
+  const queue = [...r.rest];
+  const worker = async () => {
+    for (let c = queue.shift(); c; c = queue.shift()) {
+      await commitOps(db, c);
+      done += c.length;
+      onProgress?.(done, total);
+    }
+  };
+  await Promise.all(Array.from({ length: 3 }, worker));
+  return noticeId;
+}
+
+export async function archiveNotice(actor: Actor, noticeId: string) {
+  const [{ db }, auditId] = await Promise.all([firebase(), newId()]);
+  await commitOps(db, N.archiveNotice({ actorUid: actor.uid, auditId, noticeId }));
+}
+
+/** Who read a notice (member ids), for the admin. */
+export async function readNoticeReaders(noticeId: string): Promise<string[]> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const s = await fs.getDocs(fs.query(fs.collection(db, 'noticeReads'), fs.where('noticeId', '==', noticeId)));
+  return s.docs.map((d) => String(d.data().memberId));
+}
+
+/** How many members pressed "OK" on a notice (a count query: one read per 1000 counted). */
+export async function countNoticeReads(noticeId: string): Promise<number> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const c = await fs.getCountFromServer(fs.query(fs.collection(db, 'noticeReads'), fs.where('noticeId', '==', noticeId)));
+  return c.data().count;
+}
+
+export async function setMemberGender(actor: Actor, memberId: string, gender: 'M' | 'F') {
+  const [{ db }, auditId] = await Promise.all([firebase(), newId()]);
+  await commitOps(db, W.setMemberGender({ actorUid: actor.uid, auditId, memberId, gender }));
 }

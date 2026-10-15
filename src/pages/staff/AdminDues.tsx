@@ -1,3 +1,4 @@
+import { GenderSettings } from './GenderUI';
 import { useEffect, useMemo, useState } from 'react';
 import { DateTime } from 'luxon';
 import { useApp } from '../../app/AppContext';
@@ -432,6 +433,8 @@ export function SettingsPage() {
           <label className="label" htmlFor="st-disc">{t('settings.cashierDiscount')}</label>
           <input id="st-disc" className="input num" type="number" min={0} max={100} value={d.cashierMaxDiscount} onChange={num('cashierMaxDiscount')} />
         </div>
+        <div className="divider" />
+        <GenderSettings mode={d.genderMode} hours={d.ladiesHours} onChange={(genderMode, ladiesHours) => setD((x) => ({ ...x, genderMode, ladiesHours }))} />
         {!ok && <span className="error">{t('settings.err')}</span>}
         <div className="stack-sm">
           <span className="label">{t('settings.refundPolicy')}</span>

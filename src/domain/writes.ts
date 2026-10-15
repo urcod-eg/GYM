@@ -41,7 +41,7 @@ export type BlockScope = (typeof BLOCK_SCOPES)[number];
 export const LICENSE_TYPES = ['TRIAL', 'FIXED', 'LIFETIME'] as const;
 export type LicenseType = (typeof LICENSE_TYPES)[number];
 
-export type AuditEntity = 'members' | 'users' | 'license' | 'gymPublicConfig' | 'pinSecrets' | 'wipes' | 'plans' | 'gymSettings' | 'memberships' | 'banners' | 'vipTiers' | 'financeEntries' | 'cashCloses' | 'exercises';
+export type AuditEntity = 'members' | 'users' | 'license' | 'gymPublicConfig' | 'pinSecrets' | 'wipes' | 'plans' | 'gymSettings' | 'memberships' | 'banners' | 'vipTiers' | 'financeEntries' | 'cashCloses' | 'exercises' | 'notices';
 export function audit(auditId: string, actorUid: string, action: string, entityType: AuditEntity, entityId: string, summary: DocData): WriteOp {
   return { type: 'set', path: `auditLogs/${auditId}`, data: { actorUid, action, entityType, entityId, at: SERVER_TIME, summary } };
 }
@@ -57,6 +57,8 @@ export interface RegisterInput {
   fullName: string;
   phone: string;
   assignedCoachId?: string | null;
+  /** Men / ladies (needed when the gym has ladies' hours or a ladies' section). */
+  gender?: 'M' | 'F' | null;
   /** From gymPublicConfig/main; null when the developer has not saved branding yet. */
   codePrefix: string | null;
   /** counters/members as read inside the transaction. */
@@ -86,6 +88,7 @@ export function registerMember(i: RegisterInput): { ops: WriteOp[]; memberNo: nu
         authUid: null,
         accountStatus: 'PENDING_ACTIVATION',
         assignedCoachId: i.assignedCoachId ?? null,
+        gender: i.gender === 'M' || i.gender === 'F' ? i.gender : null,
         vipTierId: null,
         blocks: {},
         searchTokens: buildSearchTokens(fullName, phoneE164, memberCode),
@@ -291,7 +294,7 @@ function assertManageable(actorUid: string, actorRoles: readonly string[], t: St
   return allowed;
 }
 
-export function updateStaff(i: { actorUid: string; actorRoles: readonly string[]; auditId: string; target: StaffTarget; roles?: string[]; status?: 'active' | 'disabled'; displayName?: string }): WriteOp[] {
+export function updateStaff(i: { actorUid: string; actorRoles: readonly string[]; auditId: string; target: StaffTarget; roles?: string[]; status?: 'active' | 'disabled'; displayName?: string; gender?: 'M' | 'F' }): WriteOp[] {
   const allowed = assertManageable(i.actorUid, i.actorRoles, i.target);
   const data: DocData = { updatedAt: SERVER_TIME, lastAuditId: i.auditId };
   const summary: DocData = {};
@@ -311,7 +314,12 @@ export function updateStaff(i: { actorUid: string; actorRoles: readonly string[]
     data.displayName = name;
     summary.displayName = name;
   }
-  if (!i.roles && !i.status && i.displayName === undefined) refuse('invalid-input');
+  if (i.gender !== undefined) {
+    if (i.gender !== 'M' && i.gender !== 'F') refuse('invalid-input');
+    data.gender = i.gender;
+    summary.gender = i.gender;
+  }
+  if (!i.roles && !i.status && i.displayName === undefined && i.gender === undefined) refuse('invalid-input');
   return [{ type: 'update', path: `users/${i.target.uid}`, data }, audit(i.auditId, i.actorUid, 'staff.update', 'users', i.target.uid, summary)];
 }
 
@@ -475,4 +483,13 @@ export function wipeDeletes(i: { members: { id: string; phoneE164: string }[]; m
   for (const p of i.extraPaths ?? []) ops.push({ type: 'delete', path: p });
   ops.push({ type: 'delete', path: 'counters/members' });
   return ops;
+}
+
+/** Men / ladies on a member file (front desk), with its audit entry. */
+export function setMemberGender(i: { actorUid: string; auditId: string; memberId: string; gender: 'M' | 'F' }): WriteOp[] {
+  if (i.gender !== 'M' && i.gender !== 'F') refuse('invalid-input');
+  return [
+    { type: 'update', path: `members/${i.memberId}`, data: { gender: i.gender, updatedAt: SERVER_TIME, lastAuditId: i.auditId } },
+    audit(i.auditId, i.actorUid, 'member.gender', 'members', i.memberId, { gender: i.gender }),
+  ];
 }
