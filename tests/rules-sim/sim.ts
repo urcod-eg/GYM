@@ -308,6 +308,12 @@ export interface EvalContext {
   now: number;
   /** Distinct document lookups made by get/exists (before) and getAfter/existsAfter (after). */
   lookups: Set<string>;
+  /**
+   * Expressions evaluated so far. Firestore stops a request at 1000. Costs follow the model of
+   * davideast/pyric: each node 1 (literals too), +1 when && / || evaluates its right side, a ternary
+   * +1 (+2 more on the false branch), +1 per literal path segment, a let 1 + its value per call.
+   */
+  exprs?: { n: number };
 }
 
 type Frame = { vars: Map<string, RV | RErr>; fnScope: MatchScope };
@@ -368,6 +374,7 @@ function member(v: RV, name: string): RV {
 }
 
 function evalNode(n: Node, f: Frame, ctx: EvalContext): RV {
+  if (ctx.exprs) ctx.exprs.n += 1;
   switch (n.t) {
     case 'lit':
       return n.v;
@@ -394,6 +401,7 @@ function evalNode(n: Node, f: Frame, ctx: EvalContext): RV {
       return new RMap(m);
     }
     case 'path': {
+      if (ctx.exprs) ctx.exprs.n += n.segs.filter((x) => typeof x === 'string').length;
       const parts = n.segs.map((s) => {
         if (typeof s === 'string') return s;
         const v = evalNode(s, f, ctx);
@@ -410,8 +418,12 @@ function evalNode(n: Node, f: Frame, ctx: EvalContext): RV {
       const v = evalNode(n.e, f, ctx);
       return typeof v === 'number' ? -v : fail('negate non-number');
     }
-    case 'tern':
-      return asBool(evalNode(n.c, f, ctx)) ? evalNode(n.a, f, ctx) : evalNode(n.b, f, ctx);
+    case 'tern': {
+      if (ctx.exprs) ctx.exprs.n += 1;
+      if (asBool(evalNode(n.c, f, ctx))) return evalNode(n.a, f, ctx);
+      if (ctx.exprs) ctx.exprs.n += 2;
+      return evalNode(n.b, f, ctx);
+    }
     case 'is':
       return isType(evalNode(n.e, f, ctx), n.type);
     case 'bin':
@@ -419,6 +431,7 @@ function evalNode(n: Node, f: Frame, ctx: EvalContext): RV {
     case 'call':
       return call(n.name, n.args, f, ctx);
     case 'nscall':
+      if (ctx.exprs) ctx.exprs.n += 1; // the namespace / receiver identifier
       // `x.f()` where x is a plain identifier parses the same way as `duration.value()`.
       if (!['duration', 'timestamp', 'math', 'hashing', 'latlng'].includes(n.ns)) return method(lookupVar(f, n.ns, ctx), n.name, n.args.map((a) => evalNode(a, f, ctx)));
       return nsCall(n.ns, n.name, n.args.map((a) => evalNode(a, f, ctx)));
@@ -460,6 +473,7 @@ function binary(n: Extract<Node, { t: 'bin' }>, f: Frame, ctx: EvalContext): RV 
       left = e;
     }
     if (left === decisive) return decisive;
+    if (ctx.exprs) ctx.exprs.n += 1;
     const right = asBool(evalNode(n.r, f, ctx));
     if (left instanceof RErr) {
       if (right === decisive) return decisive;
@@ -527,6 +541,7 @@ function call(name: string, argNodes: Node[], f: Frame, ctx: EvalContext): RV {
     fn.params.forEach((p, i) => vars.set(p, evalNode(argNodes[i], f, ctx)));
     const frame: Frame = { vars, fnScope: scope };
     for (const [k, e] of fn.lets) {
+      if (ctx.exprs) ctx.exprs.n += 1;
       try {
         vars.set(k, evalNode(e, frame, ctx));
       } catch (err) {

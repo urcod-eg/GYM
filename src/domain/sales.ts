@@ -247,7 +247,6 @@ export function saleQuote(i: { plan: PlanDoc; customPrice: number | null; discou
 export interface SaleInput {
   actorUid: string;
   actorIsAdmin: boolean;
-  auditId: string;
   membershipId: string;
   paymentId: string;
   receiptNo: string;
@@ -347,12 +346,13 @@ export function sellMembership(i: SaleInput): { ops: AnyOp[]; quote: SaleQuote; 
         createdBy: i.actorUid,
         createdAt: SERVER_TIME,
         updatedAt: SERVER_TIME,
-        lastAuditId: i.auditId,
+        // A sale is its own record (the membership and its receipt are never edited or deleted), so it
+        // writes no separate audit entry: that keeps the write inside Firestore's rules budget.
+        lastAuditId: null,
       },
     },
     payment({ id: i.paymentId, memberId: i.member.id, membershipId: i.membershipId, kind: 'SALE', amount: q.paidNow, method: i.method, reference, receiptNo: i.receiptNo, by: i.actorUid }),
-    { type: 'update', path: `members/${i.member.id}`, data: { membership: summary, balance, lastPaymentId: i.paymentId, updatedAt: SERVER_TIME, lastAuditId: i.auditId } },
-    audit(i.auditId, i.actorUid, 'membership.sell', 'memberships', i.membershipId, { plan: p.code, due: q.due, paid: q.paidNow, receipt: i.receiptNo }),
+    { type: 'update', path: `members/${i.member.id}`, data: { membership: summary, balance, lastPaymentId: i.paymentId, updatedAt: SERVER_TIME } },
   ];
   return { ops, quote: q, startsAt, endsAt };
 }

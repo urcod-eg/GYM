@@ -47,6 +47,13 @@ describe('rules simulator semantics', () => {
     expect(await allowed("resource.data.s + 1 == 'abc1'")).toBe(false);
     expect(await allowed("resource.data.s + string(1) == 'abc1'")).toBe(true);
   });
+  it('stops past 1000 evaluated expressions, like Firestore', async () => {
+    const chain = (n: number) => Array.from({ length: n }, () => 'resource.data.a == 1').join(' && ');
+    expect(await allowed(chain(50))).toBe(true);
+    const db = new SimFirestore(rules(chain(300)));
+    db.seed('t/1', { a: 1 });
+    await expect(db.client({ uid: 'u' }).get('t/1')).rejects.toThrow(/rules limit: \d+ expressions/);
+  });
   it('signed-out callers have a null auth', async () => {
     const db = new SimFirestore(rules('request.auth == null'));
     db.seed('t/1', {});

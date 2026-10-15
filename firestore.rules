@@ -40,20 +40,26 @@ service cloud.firestore {
     // Firestore allows only a few document lookups per rule, so each helper reads a document once
     // (a missing document makes get() fail, which counts as "no").
     function active() { return signedIn() && me().status == 'active'; }
+    // Rules may evaluate at most 1000 expressions, so the helpers below read the account once (u).
     // Staff roles count only in a session opened with the 4-digit code for this very sign-in
     // (auth_time changes with every new sign-in, so a stolen password alone is not enough).
     function staffSessionOk() {
       return get(sessionPath(request.auth.uid)).data.authTime == request.auth.token.auth_time;
     }
     // Staff and the developer: roles count only after the second step (code / code + security phrase).
-    function hasRole(r) { return active() && r in me().roles && (me().kind == 'member' || staffSessionOk()); }
+    function hasRole(r) { return signedIn() && roleOn(me(), r); }
+    function roleOn(u, r) { return u.status == 'active' && r in u.roles && (u.kind == 'member' || staffSessionOk()); }
+    // Any of these staff roles, in a session opened for this sign-in.
+    function staffAny(rs) { return signedIn() && staffAnyOn(me(), rs); }
+    function staffAnyOn(u, rs) { return u.status == 'active' && u.kind != 'member' && u.roles.hasAny(rs) && staffSessionOk(); }
     function isDev() { return hasRole('developer'); }
-    function isAdmin() { return hasRole('admin') || isDev(); }
+    function isAdmin() { return staffAny(['admin', 'developer']); }
     function isAccountant() { return hasRole('accountant'); }
     function isCashier() { return hasRole('cashier'); }
     function isCoach() { return hasRole('coach'); }
-    function isStaff() { return active() && me().kind in ['staff', 'developer'] && staffSessionOk(); }
-    function isFrontDesk() { return isAdmin() || isAccountant() || isCashier(); }
+    function isStaff() { return signedIn() && staffOn(me()); }
+    function staffOn(u) { return u.status == 'active' && u.kind in ['staff', 'developer'] && staffSessionOk(); }
+    function isFrontDesk() { return staffAny(['admin', 'developer', 'accountant', 'cashier']); }
 
     // Developer writes need the developer's own session (code + security phrase for this sign-in).
     // isDev() already includes it through hasRole(); the name stays for readability.
@@ -63,17 +69,21 @@ service cloud.firestore {
       let l = get(licensePath()).data;
       return l.state == 'ACTIVE' && (l.endsAt == null || request.time < l.endsAt);
     }
-    function adminWriter() { return (hasRole('admin') && licensed()) || devMfa(); }
+    // Staff writes need a valid licence; the developer's do not.
+    function writerOn(u, rs) { return staffAnyOn(u, rs) && ('developer' in u.roles || licensed()); }
+    function adminWriter() { return signedIn() && writerOn(me(), ['admin', 'developer']); }
     // Managing another staff account: never yourself; admins only non-admins; the developer (2FA) anyone.
     function canManageStaff(u) {
       let t = get(userPath(u)).data;
-      return signedIn() && u != request.auth.uid && t.kind == 'staff'
-        && (devMfa() || (hasRole('admin') && licensed() && !('admin' in t.roles)));
+      return signedIn() && u != request.auth.uid && t.kind == 'staff' && managerOf(me(), t);
+    }
+    function managerOf(a, t) {
+      return staffAnyOn(a, ['admin', 'developer']) && ('developer' in a.roles || (licensed() && !('admin' in t.roles)));
     }
     // Wiping member data: the developer, who re-entered the code + phrase in the last 10 minutes
     // (re-entering re-opens the session, so its `at` is the time of that check). Staff data is never touched.
     function devWipe() { return devMfa() && get(sessionPath(request.auth.uid)).data.at > request.time - duration.value(10, 'm'); }
-    function frontDeskWriter() { return ((hasRole('admin') || hasRole('cashier')) && licensed()) || devMfa(); }
+    function frontDeskWriter() { return signedIn() && writerOn(me(), ['admin', 'cashier', 'developer']); }
 
     // A block counts until its `until` time (null = until lifted).
     function blockedNow(b, scope) { return scope in b && (b[scope].get('until', null) == null || b[scope].until > request.time); }
@@ -81,7 +91,8 @@ service cloud.firestore {
       let b = get(memberPath(m)).data.blocks;
       return !blockedNow(b, 'LOGIN_BLOCK') && !blockedNow(b, 'TEMPORARY_SUSPENSION');
     }
-    function isMemberSelf(m) { return active() && me().kind == 'member' && me().memberId == m && memberMayUseApp(m); }
+    function isMemberSelf(m) { return signedIn() && memberSelfOn(me(), m); }
+    function memberSelfOn(u, m) { return u.status == 'active' && u.kind == 'member' && u.memberId == m && memberMayUseApp(m); }
     function ownsMemberDoc() { return isMemberSelf(resource.data.memberId); }
 
     function onlyChanges(keys) { return request.resource.data.diff(resource.data).affectedKeys().hasOnly(keys); }
@@ -212,10 +223,15 @@ service cloud.firestore {
       let d = request.resource.data;
       return d.memberId == null && d.identityCheck == null
         && d.aliasId == 's' + d.phone
-        && ((devMfa() && d.roles.hasOnly(['admin', 'accountant', 'cashier', 'coach']))
-            || (hasRole('admin') && licensed() && d.roles.hasOnly(['accountant', 'cashier', 'coach'])))
+        && inviterOk(me(), d.roles)
         && ((d.purpose == 'activate' && d.prevUid == null && !exists(aliasPath(d.aliasId)))
             || (d.purpose == 'reset' && d.prevUid is string && staffResetTarget(d)));
+    }
+    // The developer invites any staff role; an admin (licensed) any role but admin.
+    function inviterOk(a, roles) {
+      return staffAnyOn(a, ['admin', 'developer'])
+        && ('developer' in a.roles ? roles.hasOnly(['admin', 'accountant', 'cashier', 'coach'])
+            : (licensed() && roles.hasOnly(['accountant', 'cashier', 'coach'])));
     }
     function staffResetTarget(d) {
       let t = get(userPath(d.prevUid)).data;
@@ -237,7 +253,7 @@ service cloud.firestore {
       allow get: if signedIn() && (request.auth.uid == u || isAdmin());
       allow list: if isAdmin();
       allow create: if signedIn() && request.auth.uid == u && redeemedProfile(u);
-      allow update: if retiredByReset(u) || staffEdit(u);
+      allow update: if 'replacedBy' in request.resource.data.diff(resource.data).affectedKeys() ? retiredByReset(u) : staffEdit(u);
       allow delete: if resource.data.kind == 'member' && devWipe();
     }
     function redeemedProfile(u) {
@@ -266,6 +282,7 @@ service cloud.firestore {
     function staffEdit(u) {
       let t = resource.data;
       let d = request.resource.data;
+      let a = me();
       return signedIn() && u != request.auth.uid
         && t.kind == 'staff' && t.status in ['active', 'disabled']
         && onlyChanges(['roles', 'status', 'displayName', 'updatedAt', 'lastAuditId'])
@@ -273,8 +290,9 @@ service cloud.firestore {
         && d.roles is list && d.roles.size() > 0
         && d.displayName is string && d.displayName.size() >= 2 && d.displayName.size() <= 80
         && d.updatedAt == request.time
-        && ((devMfa() && d.roles.hasOnly(['admin', 'accountant', 'cashier', 'coach']))
-            || (hasRole('admin') && licensed() && !('admin' in t.roles) && d.roles.hasOnly(['accountant', 'cashier', 'coach'])))
+        && staffAnyOn(a, ['admin', 'developer'])
+        && ('developer' in a.roles ? d.roles.hasOnly(['admin', 'accountant', 'cashier', 'coach'])
+            : (licensed() && !('admin' in t.roles) && d.roles.hasOnly(['accountant', 'cashier', 'coach'])))
         && ((d.status == 'removed' && freshAudit('staff.remove', 'users', u))
             || (d.status != 'removed' && freshAudit('staff.update', 'users', u)));
     }
@@ -282,14 +300,13 @@ service cloud.firestore {
     // ---------------------------------------------------------------- staff sign-in code (4-digit PIN)
     // pinSecrets: salt + SHA-256(salt + code). No browser can read it; only these rules use it.
     match /pinSecrets/{u} {
-      allow create, update: if (canManageStaff(u) || devOwnSecret(u))
-        && exactKeys(['salt', 'hash', 'setBy', 'setAt', 'lastAuditId'])
+      allow create, update: if exactKeys(['salt', 'hash', 'setBy', 'setAt', 'lastAuditId'])
         && request.resource.data.salt is string && request.resource.data.salt.matches('^[0-9a-f]{32}$')
         && request.resource.data.hash is string && request.resource.data.hash.matches('^[0-9a-f]{64}$')
         && request.resource.data.setBy == request.auth.uid
         && request.resource.data.setAt == request.time
-        && ((canManageStaff(u) && freshAudit('staff.pin', 'pinSecrets', u))
-            || (devOwnSecret(u) && freshAudit('dev.secret', 'pinSecrets', u)));
+        && (request.auth.uid == u ? (devOwnSecret(u) && freshAudit('dev.secret', 'pinSecrets', u))
+            : (canManageStaff(u) && freshAudit('staff.pin', 'pinSecrets', u)));
     }
     // The developer sets their own code + phrase once (first sign-in), and may change it later
     // only from an open session. Nobody else can set or reset it.
@@ -309,15 +326,17 @@ service cloud.firestore {
     match /pinTries/{u} {
       allow get: if signedIn() && (request.auth.uid == u || isAdmin());
       allow list: if isAdmin();
-      allow create, update: if pinAttemptOk(u) || pinSuccessReset(u) || pinAdminReset(u);
+      // own attempt (a code) or own reset after success (no code); anyone else: an admin unlock
+      allow create, update: if signedIn() && (request.auth.uid != u ? pinAdminReset(u)
+        : (request.resource.data.pin == null ? pinSuccessReset(u) : pinAttemptOk(u)));
     }
     function pinAttemptOk(u) {
       let d = request.resource.data;
       return signedIn() && request.auth.uid == u && active()
         && exactKeys(['pin', 'count', 'authTime', 'at'])
         && d.pin is string
-        && ((me().kind == 'staff' && d.pin.matches('^[0-9]{4}$'))
-            || (me().kind == 'developer' && d.pin.size() <= 140 && d.pin.matches('^[0-9]{4}:.{10,128}$')))
+        && (me().kind == 'staff' ? d.pin.matches('^[0-9]{4}$')
+            : (me().kind == 'developer' && d.pin.size() <= 140 && d.pin.matches('^[0-9]{4}:.{10,128}$')))
         && d.authTime == request.auth.token.auth_time
         && d.at == request.time
         && ((resource == null && d.count == 1) || (resource != null && d.count == resource.data.count + 1))
@@ -364,10 +383,22 @@ service cloud.firestore {
       allow get: if isMemberSelf(m) || isFrontDesk() || (isCoach() && resource.data.assignedCoachId == request.auth.uid);
       allow list: if isFrontDesk() || (isCoach() && resource.data.assignedCoachId == request.auth.uid);
       allow create: if frontDeskWriter() && newMember(m);
-      allow update: if memberLinkedByInvite(m) || memberBlocks(m)
-        || memberSale(m) || memberBalancePay(m) || memberGrant(m) || memberCancel(m)
-        || memberCheckin(m) || memberVip(m) || memberCoach(m);
+      allow update: if memberUpdate(m, request.resource.data.diff(resource.data).affectedKeys());
       allow delete: if devWipe();
+    }
+    // Firestore evaluates at most 1000 expressions per rule, so each kind of change to a member file
+    // is routed to its one check by the fields it touches (each check still verifies every field).
+    function memberUpdate(m, k) {
+      return 'lastCheckinId' in k ? memberCheckin(m)
+        : 'lastPaymentId' in k ? ('membership' in k ? memberSale(m) : memberBalancePay(m))
+        : 'membership' in k ? memberCancel(m)
+        : 'balance' in k ? memberGrant(m)
+        : 'blocks' in k ? memberBlocks(m)
+        : ('authUid' in k || 'lastInviteId' in k || 'accountStatus' in k) ? memberLinkedByInvite(m)
+        : 'vipTierId' in k ? memberVip(m)
+        : ('assignedCoachId' in k || 'assignedCoachName' in k) ? memberCoach(m)
+        // nothing but the stamp changes (e.g. the same tier saved again)
+        : (memberVip(m) || memberCoach(m) || memberBlocks(m));
     }
     function newMember(m) {
       let d = request.resource.data;
@@ -416,8 +447,8 @@ service cloud.firestore {
     // Phone numbers are unique per gym: the index entry is created with the member and never changes.
     match /phoneIndex/{p} {
       allow get: if isFrontDesk();
-      allow create: if frontDeskWriter()
-        && exactKeys(['memberId', 'createdAt'])
+      // Written with a new member (whose rule checks who registers) in the same request.
+      allow create: if exactKeys(['memberId', 'createdAt'])
         && request.resource.data.createdAt == request.time
         && getAfter(memberPath(request.resource.data.memberId)).data.createdAt == request.time
         && getAfter(memberPath(request.resource.data.memberId)).data.phoneE164 == p;
@@ -427,8 +458,9 @@ service cloud.firestore {
     // Member numbers: each registration moves the counter by exactly one, in the same transaction.
     match /counters/{c} {
       allow get: if isFrontDesk();
-      allow create: if c == 'members' && frontDeskWriter() && counterBump(10001);
-      allow update: if c == 'members' && frontDeskWriter() && counterBump(resource.data.next);
+      // Moves only with a member created in the same request (whose rule checks who registers).
+      allow create: if c == 'members' && counterBump(10001);
+      allow update: if c == 'members' && counterBump(resource.data.next);
       // After a wipe the numbering starts again from 10001.
       allow delete: if c == 'members' && devWipe();
     }
@@ -456,7 +488,7 @@ service cloud.firestore {
     // Every amount is recomputed here from the plan, the settings and the member file, so a modified
     // browser cannot change a price, a discount, a deposit or a refund. Money is integer piasters.
 
-    function adminLike() { return hasRole('admin') || devMfa(); }
+    function adminLike() { return isAdmin(); }
 
     // ---------------------------------------------------------------- plans (admin)
     match /plans/{p} {
@@ -511,7 +543,6 @@ service cloud.firestore {
       let p = get(planPath(d.planId)).data;
       let m = get(memberPath(d.memberId)).data;
       let bal = m.get('balance', null);
-      let cur = effPeriod(m.get('membership', null));
       return exactKeys(['memberId', 'planId', 'plan', 'customDays', 'startsAt', 'endsAt', 'base', 'discountPct', 'discount', 'carried', 'due', 'paidNow', 'mode', 'balanceDueAt', 'method', 'reference', 'receiptNo', 'paymentId', 'renewal', 'status', 'cancel', 'createdBy', 'createdAt', 'updatedAt', 'lastAuditId'])
         && p.active == true
         && d.renewal == (m.get('membership', null) != null)
@@ -529,29 +560,28 @@ service cloud.firestore {
         && d.carried == (bal == null ? 0 : bal.remaining)
         && d.due == d.base - d.discount + d.carried
         // full payment, or a deposit within the admin's settings
-        && ((d.mode == 'FULL' && d.paidNow == d.due && d.balanceDueAt == null)
-            || (d.mode == 'DEPOSIT' && p.unit != 'session' && settings().depositEnabled == true
-                && d.paidNow is int && d.paidNow < d.due
-                && d.paidNow * 100 >= d.due * settings().depositMinPercent
-                && d.balanceDueAt is timestamp
-                && d.balanceDueAt > request.time + duration.value(1, 'd')
-                && d.balanceDueAt <= request.time + duration.value(settings().depositMaxGraceDays + 2, 'd')))
-        && d.method in ['CASH', 'WALLET', 'INSTAPAY', 'BANK']
-        && (d.reference == null || (d.method != 'CASH' && d.reference is string && d.reference.size() >= 1 && d.reference.size() <= 40))
-        && d.receiptNo is string && d.receiptNo.matches('^R-[0-9]{6}-[0-9A-Z]{5}$')
+        && (d.mode == 'FULL' ? (d.paidNow == d.due && d.balanceDueAt == null)
+            : (d.mode == 'DEPOSIT' && p.unit != 'session' && depositOk(d, settings())))
+        // method, reference and receipt number: checked on the receipt (saleReceipt), which must be in this write
         && d.paymentId is string
-        // dates: from today (no back-dating), appended to a running period, with the plan's length
-        && d.startsAt is timestamp && d.endsAt is timestamp
-        && d.startsAt >= request.time - duration.value(1, 'd')
-        && d.startsAt <= request.time + duration.value(62, 'd')
-        && (cur == null || cur.endsAt <= request.time || d.startsAt >= cur.endsAt)
-        && lengthOk(d, p)
+        // dates (no back-dating, appended to a running period, the plan's length): checked on the
+        // member file (memberSale), which must change in this same write — that keeps each check
+        // under Firestore's 1000-expression limit
         && d.status == 'ACTIVE' && d.cancel == null
         && d.createdBy == request.auth.uid && d.createdAt == request.time && d.updatedAt == request.time
         && getAfter(memberPath(d.memberId)).data.membership.id == id
         // the receipt is written in the same request, so every sale shows in the day's cash
         && getAfter(payPath(d.paymentId)).data.membershipId == id
-        && freshAudit('membership.sell', 'memberships', id);
+        // a sale is its own record (never edited or deleted), so it has no separate audit entry
+        && d.lastAuditId == null;
+    }
+    function depositOk(d, st) {
+      return st.depositEnabled == true
+        && d.paidNow is int && d.paidNow < d.due
+        && d.paidNow * 100 >= d.due * st.depositMinPercent
+        && d.balanceDueAt is timestamp
+        && d.balanceDueAt > request.time + duration.value(1, 'd')
+        && d.balanceDueAt <= request.time + duration.value(st.depositMaxGraceDays + 2, 'd');
     }
     // Day/week/custom: whole calendar days (±1h for daylight saving). Month/year: calendar months.
     function lengthOk(d, p) {
@@ -591,8 +621,8 @@ service cloud.firestore {
       let d = request.resource.data;
       let s = getAfter(msPath(d.membership.id)).data;
       let cur = effPeriod(resource.data.get('membership', null));
-      return frontDeskWriter()
-        && onlyChanges(['membership', 'balance', 'lastPaymentId', 'updatedAt', 'lastAuditId'])
+      // who may sell: checked on the membership created in this request (sellOk)
+      return onlyChanges(['membership', 'balance', 'lastPaymentId', 'updatedAt'])
         && s.memberId == m && s.createdAt == request.time
         && d.membership == {'id': d.membership.id, 'planNameAr': s.plan.nameAr, 'planNameEn': s.plan.nameEn, 'unit': s.plan.unit,
                             'startsAt': s.startsAt, 'endsAt': s.endsAt, 'status': 'ACTIVE',
@@ -604,14 +634,20 @@ service cloud.firestore {
               ? {'remaining': s.due - s.paidNow, 'total': s.due, 'dueAt': s.balanceDueAt, 'membershipId': d.membership.id, 'graceUntil': null, 'graceReason': ''}
               : null)
         && d.lastPaymentId == s.paymentId
-        && d.updatedAt == request.time && d.lastAuditId == s.lastAuditId;
+        && d.updatedAt == request.time
+        // the sale's dates: from today (no back-dating), appended to a running period, with the plan's length
+        && s.startsAt is timestamp && s.endsAt is timestamp
+        && s.startsAt >= request.time - duration.value(1, 'd')
+        && s.startsAt <= request.time + duration.value(62, 'd')
+        && (cur == null || cur.endsAt <= request.time || s.startsAt >= cur.endsAt)
+        && lengthOk(s, s.plan);
     }
     function memberBalancePay(m) {
       let d = request.resource.data;
       let b = resource.data.balance;
       let pay = getAfter(payPath(d.lastPaymentId)).data;
-      return frontDeskWriter()
-        && onlyChanges(['balance', 'lastPaymentId', 'updatedAt', 'lastAuditId'])
+      // who may collect: checked on the receipt created in this request (balanceReceipt)
+      return onlyChanges(['balance', 'lastPaymentId', 'updatedAt', 'lastAuditId'])
         && b != null
         && pay.kind == 'BALANCE' && pay.memberId == m && pay.at == request.time
         && pay.amount is int && pay.amount > 0 && pay.amount <= b.remaining
@@ -641,8 +677,8 @@ service cloud.firestore {
       let cur = resource.data.membership;
       let s = getAfter(msPath(cur.id)).data;
       let bal = resource.data.get('balance', null);
-      return adminWriter()
-        && onlyChanges(['membership', 'balance', 'updatedAt', 'lastAuditId'])
+      // who may cancel: checked on the membership cancelled in this request (cancelOk)
+      return onlyChanges(['membership', 'balance', 'updatedAt', 'lastAuditId'])
         && s.status == 'CANCELLED' && s.updatedAt == request.time
         && cur.status == 'ACTIVE'
         && d.membership.diff(cur).affectedKeys().hasOnly(['status']) && d.membership.status == 'CANCELLED'
@@ -668,7 +704,8 @@ service cloud.firestore {
     function saleReceipt(id) {
       let d = request.resource.data;
       let s = getAfter(msPath(d.membershipId)).data;
-      return d.kind == 'SALE' && frontDeskWriter()
+      // the sale created in this request checks who sells (sellOk)
+      return d.kind == 'SALE'
         && s.paymentId == id && s.createdAt == request.time
         && d.amount == s.paidNow && d.memberId == s.memberId
         && d.method == s.method && d.reference == s.reference && d.receiptNo == s.receiptNo;
@@ -683,7 +720,8 @@ service cloud.firestore {
     function refundReceipt(id) {
       let d = request.resource.data;
       let s = getAfter(msPath(d.membershipId)).data;
-      return d.kind == 'REFUND' && adminWriter()
+      // the cancellation in this request checks who refunds (cancelOk)
+      return d.kind == 'REFUND'
         && s.cancel.paymentId == id && s.updatedAt == request.time
         && d.amount == s.cancel.refund && d.memberId == s.memberId && d.reference == null;
     }
@@ -698,7 +736,8 @@ service cloud.firestore {
             && exactKeys(['code', 'at', 'usedAt'])
             && request.resource.data.code is string && request.resource.data.code.matches('^[A-Z2-9]{8}$')
             && request.resource.data.at == request.time && request.resource.data.usedAt == null)
-        || (frontDeskWriter() && resource != null && resource.data.usedAt == null
+        // used by a check-in in this same request (whose rule checks who checks in)
+        || (resource != null && resource.data.usedAt == null
             && onlyChanges(['usedAt']) && request.resource.data.usedAt == request.time
             && getAfter(memberPath(m)).data.lastCheckInAt == request.time);
       allow delete: if devWipe();
@@ -742,8 +781,8 @@ service cloud.firestore {
       let ci = getAfter(checkinPath(d.lastCheckinId)).data;
       let c = r.membership;
       let counts = c.status == 'ACTIVE' && c.startsAt <= request.time && request.time < c.endsAt && c.get('visitQuota', null) != null;
-      return frontDeskWriter()
-        && ci.memberId == m && ci.at == request.time && d.lastCheckInAt == request.time
+      // who may check in: checked on the check-in created in this request (checkinOk)
+      return ci.memberId == m && ci.at == request.time && d.lastCheckInAt == request.time
         && ((!counts && onlyChanges(['lastCheckInAt', 'lastCheckinId']))
             || (counts && onlyChanges(['lastCheckInAt', 'lastCheckinId', 'membership'])
                 && d.membership.diff(c).affectedKeys().hasOnly(['visitsUsed'])
@@ -832,7 +871,7 @@ service cloud.firestore {
 
     // ================================================================ Phase 6: books and cash
     // Income/expense entries are append-only; an admin voids a mistake with a reason (never edits it).
-    function bookWriter() { return adminWriter() || (hasRole('accountant') && licensed()); }
+    function bookWriter() { return signedIn() && writerOn(me(), ['admin', 'accountant', 'developer']); }
     match /financeEntries/{e} {
       allow read: if isAdmin() || isAccountant();
       allow create: if bookWriter() && financeShape() && freshAudit('finance.add', 'financeEntries', e);
@@ -907,7 +946,8 @@ service cloud.firestore {
     // ---------------------------------------------------------------- audit log (append-only)
     match /auditLogs/{aid} {
       allow get, list: if isAdmin();
-      allow create: if active() && auditShape(aid);
+      // signed in and the author; who may make the described change is checked on that document
+      allow create: if signedIn() && auditShape(aid);
     }
     function auditShape(aid) {
       let d = request.resource.data;
@@ -917,17 +957,11 @@ service cloud.firestore {
         && d.action is string && d.action.size() <= 40
         && d.entityId is string
         && d.summary is map && d.summary.size() <= 8
-        && ((d.entityType == 'members' && getAfter(memberPath(d.entityId)).data.lastAuditId == aid)
-            || (d.entityType == 'users' && getAfter(userPath(d.entityId)).data.lastAuditId == aid)
-            || (d.entityType == 'license' && d.entityId == 'main' && getAfter(licensePath()).data.lastAuditId == aid)
-            || (d.entityType == 'gymPublicConfig' && d.entityId == 'main' && getAfter(configPath()).data.lastAuditId == aid)
-            || (d.entityType == 'pinSecrets' && getAfter(secretPath(d.entityId)).data.lastAuditId == aid)
-            || (d.entityType == 'wipes' && getAfter(/databases/$(database)/documents/wipes/$(d.entityId)).data.lastAuditId == aid)
-            || (d.entityType == 'plans' && getAfter(planPath(d.entityId)).data.lastAuditId == aid)
-            || (d.entityType == 'gymSettings' && d.entityId == 'main' && getAfter(settingsPath()).data.lastAuditId == aid)
-            || (d.entityType == 'memberships' && getAfter(msPath(d.entityId)).data.lastAuditId == aid)
-            || (d.entityType in ['banners', 'vipTiers', 'financeEntries', 'cashCloses', 'exercises']
-                && getAfter(/databases/$(database)/documents/$(d.entityType)/$(d.entityId)).data.lastAuditId == aid));
+        // the described document, changed in this same write, points back at this entry (each of those
+        // documents has its own rules, so an entry can only describe a change that was allowed)
+        && d.entityType in ['members', 'users', 'license', 'gymPublicConfig', 'pinSecrets', 'wipes', 'plans', 'gymSettings',
+                            'memberships', 'banners', 'vipTiers', 'financeEntries', 'cashCloses', 'exercises']
+        && getAfter(/databases/$(database)/documents/$(d.entityType)/$(d.entityId)).data.lastAuditId == aid;
     }
 
     // ---------------------------------------------------------------- later phases: read-only for now

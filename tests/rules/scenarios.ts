@@ -705,6 +705,19 @@ export function defineScenarios(name: string, h: Harness) {
         await h.seed({ 'members/mem2': { ...((await h.peek('members/mem2')) as Record<string, unknown>), lastCheckInAt: new Date(Date.now() - H1) } });
         await denied(h.as(CASHIER).commit(checkIn({ actorUid: 'cash1', checkinId: nextId('ci-'), member: await em(), method: 'MANUAL', code: null, counts: true }) as Op[]));
       });
+      it('an old check-in cannot be replayed to use up visits or block the door', async () => {
+        await seedMember({ membership: summary({ unit: 'session', visitQuota: 5, visitsUsed: 0, endsAt: new Date(Date.now() + 10 * H1) }) });
+        const ops = checkIn({ actorUid: 'cash1', checkinId: nextId('ci-'), member: await em(), method: 'MANUAL', code: null, counts: true }) as Op[];
+        await ok(h.as(CASHIER).commit(ops));
+        const old = (ops[0] as { path: string }).path.split('/')[1];
+        await h.seed({ [`checkins/${old}`]: { ...((await h.peek(`checkins/${old}`)) as Record<string, unknown>), at: new Date(Date.now() - H1) } });
+        await h.seed({ 'members/mem2': { ...((await h.peek('members/mem2')) as Record<string, unknown>), lastCheckInAt: new Date(Date.now() - H1), lastCheckinId: 'other' } });
+        const used = ((await h.peek('members/mem2'))?.membership as { visitsUsed: number }).visitsUsed;
+        for (const who of [COACH, CASHIER]) {
+          await denied(h.as(who).commit([{ type: 'update', path: 'members/mem2', data: { lastCheckInAt: SERVER_TIME, lastCheckinId: old, 'membership.visitsUsed': used + 1 } }]));
+          await denied(h.as(who).commit([{ type: 'update', path: 'members/mem2', data: { lastCheckInAt: SERVER_TIME, lastCheckinId: old } }]));
+        }
+      });
       it('not twice within two minutes; coaches and members cannot check anyone in', async () => {
         await seedMember({ lastCheckInAt: new Date(Date.now() - 30_000) });
         await denied(h.as(CASHIER).commit(checkIn({ actorUid: 'cash1', checkinId: nextId('ci-'), member: await em(), method: 'MANUAL', code: null, counts: false }) as Op[]));
@@ -761,7 +774,6 @@ export function defineScenarios(name: string, h: Harness) {
       const base = (over: Partial<SaleInput> = {}): SaleInput => ({
         actorUid: 'cash1',
         actorIsAdmin: false,
-        auditId: nextId('ms-a-'),
         membershipId: nextId('ms-'),
         paymentId: nextId('pay-'),
         receiptNo: newReceiptNo(new Date()),
@@ -882,13 +894,42 @@ export function defineScenarios(name: string, h: Harness) {
         await h.seed({ 'license/main': { type: 'TRIAL', state: 'SUSPENDED', startsAt: new Date(Date.now() - D), endsAt: null, version: 2, note: '', updatedAt: new Date(), updatedBy: 'dev', lastAuditId: 'seed-l2' } });
         await denied(sell(CASHIER));
       });
+      it('the receipt, the member file and the audit entry never pass on their own (they lean on the sale)', async () => {
+        const ops = sellMembership(base()).ops as Op[];
+        const only = (prefix: string) => ops.filter((o) => o.path.startsWith(prefix));
+        for (const who of [COACH, MEMBER1, CASHIER]) {
+          await denied(h.as(who).commit(only('payments/')));
+          await denied(h.as(who).commit(only('members/')));
+          await denied(h.as(who).commit([...only('payments/'), ...only('members/')]));
+        }
+        // a coach cannot ride a cashier's sale shape either
+        await denied(h.as(COACH).commit(sellMembership(base({ actorUid: 'coach1' })).ops as Op[]));
+      });
+      it('a missing phone index entry cannot be filled in outside a registration', async () => {
+        const w = world(Date.now());
+        const idx = Object.keys(w).find((k) => k.startsWith('phoneIndex/'))!;
+        const phone = idx.split('/')[1];
+        const memberId = (w[idx] as { memberId: string }).memberId;
+        await h.reset();
+        const rest = Object.fromEntries(Object.entries(w).filter(([k]) => k !== idx));
+        rest[`members/${memberId}`] = { ...rest[`members/${memberId}`], createdAt: new Date(Date.now() - D) };
+        await h.seed(rest);
+        await denied(h.as(CASHIER).commit([{ type: 'set', path: `phoneIndex/${phone}`, data: { memberId, createdAt: SERVER_TIME } }]));
+      });
+      it('a phone index entry, a counter move or an audit entry alone is refused', async () => {
+        const r = registerMember({ actorUid: 'coach1', memberId: 'x-mem', auditId: 'x-aud', fullName: 'منى حسن', phone: '01014445555', codePrefix: 'PLS', counter: { next: 10004 }, phoneOwner: null });
+        for (const prefix of ['phoneIndex/', 'counters/', 'auditLogs/']) {
+          await denied(h.as(COACH).commit((r.ops as Op[]).filter((o) => o.path.startsWith(prefix))));
+        }
+        await denied(h.as(COACH).commit((r.ops as Op[]).filter((o) => !o.path.startsWith('members/'))));
+      });
     });
 
     describe('Phase 3: balances, entry permission and refunds', () => {
       const setup = async () => {
         const msId = nextId('ms-');
         const i: SaleInput = {
-          actorUid: 'cash1', actorIsAdmin: false, auditId: nextId('ms-a-'), membershipId: msId, paymentId: nextId('pay-'), receiptNo: newReceiptNo(new Date()),
+          actorUid: 'cash1', actorIsAdmin: false, membershipId: msId, paymentId: nextId('pay-'), receiptNo: newReceiptNo(new Date()),
           member: { id: 'mem2', membership: null, balance: null }, planId: 'p_m1', plan: PLAN_M1, customDays: null, customPrice: null, startDate: cairoToday(),
           discountPct: 0, mode: 'DEPOSIT', deposit: 60000, balanceDueDate: cairoToday(5), method: 'CASH', reference: null, settings: DEFAULT_GYM_SETTINGS, now: new Date(),
         };
@@ -950,6 +991,44 @@ export function defineScenarios(name: string, h: Harness) {
         const m = await h.peek('members/mem2');
         expect((m?.membership as { status: string }).status).toBe('CANCELLED');
         expect(m?.balance).toBeNull();
+      });
+      it('old receipts and sales cannot be replayed to move a member file', async () => {
+        const { msId, balance, summary } = await setup();
+        const pay = (amount: number, b: BalanceDoc) => payBalance({ actorUid: 'cash1', auditId: nextId('bp-'), paymentId: nextId('pay-'), receiptNo: newReceiptNo(new Date()), memberId: 'mem2', balance: b, amount, method: 'CASH', reference: null }) as Op[];
+        const first = pay(10000, balance);
+        await ok(h.as(CASHIER).commit(first));
+        await ok(h.as(CASHIER).commit(pay(10000, { ...balance, remaining: 30000 })));
+        // re-use the first remainder receipt to lower the balance again, without paying
+        const p1 = (first[0] as { path: string }).path.split('/')[1];
+        await h.seed({ [`payments/${p1}`]: { ...((await h.peek(`payments/${p1}`)) as Record<string, unknown>), at: new Date(Date.now() - H) } });
+        const replay = (who: AuthSpec) => {
+          const ops = pay(10000, { ...balance, remaining: 20000 }).filter((o) => !o.path.startsWith('payments/'));
+          (ops[0] as { data: Record<string, unknown> }).data.lastPaymentId = p1;
+          return h.as(who).commit(ops);
+        };
+        await denied(replay(CASHIER));
+        await denied(replay(COACH));
+        // after a cancellation, the old sale cannot be written back onto the member file
+        const ms = (await h.peek(`memberships/${msId}`)) as Record<string, unknown>;
+        await h.seed({ [`memberships/${msId}`]: { ...ms, status: 'CANCELLED', createdAt: new Date(Date.now() - H) }, 'members/mem2': { ...((await h.peek('members/mem2')) as Record<string, unknown>), membership: { ...summary, status: 'CANCELLED' }, balance: null, lastPaymentId: 'other' } });
+        const restore = { type: 'update' as const, path: 'members/mem2', data: { membership: { ...summary, prev: null }, balance, lastPaymentId: ms.paymentId, updatedAt: SERVER_TIME } };
+        await denied(h.as(COACH).commit([restore]));
+        await denied(h.as(CASHIER).commit([restore]));
+      });
+      it('a sale must move the member file and have exactly one receipt', async () => {
+        const i = { actorUid: 'cash1', actorIsAdmin: false, membershipId: nextId('ms-'), paymentId: nextId('pay-'), receiptNo: newReceiptNo(new Date()),
+          member: { id: 'mem2', membership: null, balance: null }, planId: 'p_m1', plan: PLAN_M1, customDays: null, customPrice: null, startDate: cairoToday(),
+          discountPct: 0, mode: 'FULL' as const, deposit: 0, balanceDueDate: null, method: 'CASH' as const, reference: null, settings: DEFAULT_GYM_SETTINGS, now: new Date() };
+        const ops = sellMembership(i).ops as Op[];
+        // without the member file (where the dates are checked), e.g. a back-dated period
+        const noFile = structuredClone(ops.filter((o) => !o.path.startsWith('members/')));
+        (noFile[0] as { data: Record<string, unknown> }).data.startsAt = new Date(Date.now() - 40 * D);
+        await denied(h.as(CASHIER).commit(noFile));
+        await denied(h.as(CASHIER).commit(ops.filter((o) => !o.path.startsWith('members/'))));
+        // a second receipt for the same sale (double-counted cash)
+        const extra = { ...(ops[1] as { type: 'set'; path: string; data: Record<string, unknown> }), path: `payments/${nextId('pay-')}` };
+        await denied(h.as(CASHIER).commit([...ops, extra]));
+        await ok(h.as(CASHIER).commit(ops));
       });
       it('receipts cannot be written alone, edited or deleted', async () => {
         await denied(h.as(CASHIER).commit([{ type: 'set', path: 'payments/fake', data: { memberId: 'mem2', membershipId: null, kind: 'BALANCE', amount: 100, method: 'CASH', reference: null, receiptNo: 'R-261015-ABCDE', by: 'cash1', at: SERVER_TIME } }]));

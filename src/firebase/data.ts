@@ -451,7 +451,8 @@ export async function wipeMemberData(actor: Actor, devValue: string, onProgress?
   });
   // Small batches: every delete is checked by the rules, which allow only a few document reads per request.
   const chunks: (typeof ops)[] = [];
-  for (let i = 0; i < ops.length; i += 8) chunks.push(ops.slice(i, i + 8));
+  // Small batches: Firestore rules evaluate at most 1000 expressions per request.
+  for (let i = 0; i < ops.length; i += 4) chunks.push(ops.slice(i, i + 4));
   let done = 0;
   const worker = async () => {
     for (let c = chunks.shift(); c; c = chunks.shift()) {
@@ -497,13 +498,13 @@ export async function saveSettings(actor: Actor, settings: S.GymSettingsDoc) {
   await commitOps(db, S.setGymSettings({ actorUid: actor.uid, auditId, settings }));
 }
 
-export type SaleRequest = Omit<S.SaleInput, 'actorUid' | 'actorIsAdmin' | 'auditId' | 'membershipId' | 'paymentId' | 'receiptNo' | 'now'>;
+export type SaleRequest = Omit<S.SaleInput, 'actorUid' | 'actorIsAdmin' | 'membershipId' | 'paymentId' | 'receiptNo' | 'now'>;
 
 export async function sell(actor: Actor, req: SaleRequest) {
   const { db } = await firebase();
-  const [auditId, membershipId, paymentId] = await Promise.all([newId(), docId('memberships'), docId('payments')]);
+  const [membershipId, paymentId] = await Promise.all([docId('memberships'), docId('payments')]);
   const now = new Date();
-  const r = S.sellMembership({ ...req, actorUid: actor.uid, actorIsAdmin: isAdminActor(actor), auditId, membershipId, paymentId, receiptNo: S.newReceiptNo(now), now });
+  const r = S.sellMembership({ ...req, actorUid: actor.uid, actorIsAdmin: isAdminActor(actor), membershipId, paymentId, receiptNo: S.newReceiptNo(now), now });
   await commitOps(db, r.ops);
   return { membershipId, receiptNo: (r.ops[0] as W.WriteOp).data.receiptNo as string, quote: r.quote, startsAt: r.startsAt, endsAt: r.endsAt };
 }

@@ -3,6 +3,7 @@
  * Writes are atomic: the whole batch is evaluated against the state before and after it, exactly
  * like Firestore's get() / getAfter(), and nothing is applied unless every operation is allowed.
  */
+import { appendFileSync } from 'node:fs';
 import { SERVER_TIME, type WriteOp } from '../../src/domain/writes';
 import { decide, parseRules, resourceOf, RMap, RPath, RTime, toRV, type EvalContext, type RV } from './sim';
 
@@ -25,6 +26,9 @@ export class Denied extends Error {
 
 const MAX_LOOKUPS_PER_DOC = 10;
 const MAX_LOOKUPS_PER_REQUEST = 20;
+// Firestore evaluates at most 1000 expressions per request. We count them as davideast/pyric does
+// (see sim.ts) and, to be safe, add up every document of a batch against one budget.
+const MAX_EXPRESSIONS = Number(process.env.MAX_EXPRESSIONS ?? 1000);
 
 type Data = Record<string, unknown>;
 
@@ -76,7 +80,7 @@ export class SimFirestore {
     return RMap.of({ uid: auth.uid, token: RMap.of(token) });
   }
 
-  evaluate(method: string, path: string, auth: AuthSpec | null, now: Date, before: Map<string, Data>, after: Map<string, Data>, newData: Data | null, lookups: Set<string>) {
+  evaluate(method: string, path: string, auth: AuthSpec | null, now: Date, before: Map<string, Data>, after: Map<string, Data>, newData: Data | null, lookups: Set<string>, exprs?: { n: number; ops: string[] }) {
     const req: Record<string, RV> = {
       auth: this.authRV(auth),
       time: new RTime(now.getTime()),
@@ -92,9 +96,14 @@ export class SimFirestore {
       after: { get: (p) => after.get(p) },
       now: now.getTime(),
       lookups: own,
+      exprs: { n: 0 },
     };
     const d = decide(this.root, method, path, ctx);
     own.forEach((l) => lookups.add(l));
+    const n = ctx.exprs!.n;
+    if (exprs) exprs.n += n;
+    else if (n > MAX_EXPRESSIONS) throw new Error(`rules limit: ${n} expressions for ${method} ${path} (max ${MAX_EXPRESSIONS})`);
+    if (exprs) exprs.ops.push(`${method} ${path.split('/')[0]}:${n}`);
     if (own.size > MAX_LOOKUPS_PER_DOC) throw new Error(`rules limit: ${own.size} document lookups for ${method} ${path} (max ${MAX_LOOKUPS_PER_DOC})`);
     return d;
   }
@@ -152,10 +161,14 @@ export class SimClient {
       }
     }
     const lookups = new Set<string>();
+    const exprs = { n: 0, ops: [] as string[] };
     ops.forEach((op, i) => {
-      const d = this.db.evaluate(methods[i], op.path, this.auth, now, before, after, op.type === 'delete' ? null : after.get(op.path)!, lookups);
+      const d = this.db.evaluate(methods[i], op.path, this.auth, now, before, after, op.type === 'delete' ? null : after.get(op.path)!, lookups, exprs);
       if (!d.allowed) throw new Denied(`${methods[i]} ${op.path}${d.errors.length ? ' — ' + d.errors.join(' | ') : ''}`);
     });
+    if (process.env.EXPR_LOG) appendFileSync(process.env.EXPR_LOG, `${exprs.n} ${exprs.ops.join(' ')}\n`);
+    // Firestore counts expressions across the whole request (every document of a batch together).
+    if (exprs.n > MAX_EXPRESSIONS) throw new Error(`rules limit: ${exprs.n} expressions in one request (max ${MAX_EXPRESSIONS}): ${exprs.ops.join(', ')}`);
     if (lookups.size > MAX_LOOKUPS_PER_REQUEST) throw new Error(`rules limit: ${lookups.size} document lookups in one batch (max ${MAX_LOOKUPS_PER_REQUEST})`);
     this.db.docs = after;
   }

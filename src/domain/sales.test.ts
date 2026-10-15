@@ -6,7 +6,7 @@ import { WriteError } from './writes';
 const M1: PlanDoc = { code: 'M1', nameAr: 'شهر', nameEn: '1 month', unit: 'month', value: 1, visitQuota: null, price: 100000, featured: false, active: true, sort: 1 };
 const today = () => DateTime.now().setZone('Africa/Cairo').toISODate()!;
 const base = (over: Partial<SaleInput> = {}): SaleInput => ({
-  actorUid: 'c', actorIsAdmin: false, auditId: 'a', membershipId: 'ms', paymentId: 'p', receiptNo: 'R-261015-ABCDE',
+  actorUid: 'c', actorIsAdmin: false, membershipId: 'ms', paymentId: 'p', receiptNo: 'R-261015-ABCDE',
   member: { id: 'm', membership: null, balance: null }, planId: 'p_m1', plan: M1, customDays: null, customPrice: null,
   startDate: today(), discountPct: 0, mode: 'FULL', deposit: 0, balanceDueDate: null, method: 'CASH', reference: null,
   settings: DEFAULT_GYM_SETTINGS, now: new Date(), ...over,
