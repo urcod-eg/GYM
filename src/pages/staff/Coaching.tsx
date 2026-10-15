@@ -168,7 +168,10 @@ function WorkoutEditor({ memberId, coachId, initial, onClose }: { memberId: stri
     setErr(null);
     try {
       await data.saveWorkoutPlan(actor, memberId, coachId, p);
-      toast(t('coach.saved'), 'success');
+      // A day with a title but no named exercise is saved empty: say so, the member would see nothing to do.
+      const empty = p.days.filter((d) => !d.exercises.some((e) => e.name.trim()));
+      if (empty.length) toast(t('coach.emptyDays', { days: empty.map((d) => t(DAY_KEYS[d.day])).join(' · ') }));
+      else toast(t('coach.saved'), 'success');
       onClose();
     } catch (e) {
       setErr(errText(e));

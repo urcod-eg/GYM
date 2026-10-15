@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 /**
  * Athlete photography (cut-outs, transparent background) used across the app.
  * Files live in public/media and are cached by the service worker as public assets.
@@ -43,3 +44,28 @@ export const PROMO_FIGURES: { figure: Figure; tone: 'red' | 'gold' | 'blue' }[] 
   { figure: 'squat', tone: 'blue' },
   { figure: 'abs', tone: 'gold' },
 ];
+
+/** Member tab artwork (public/media/tab-*.webp). Replace a file with the same name to change it. */
+export type TabArt = 'home' | 'workout' | 'progress' | 'more';
+
+/**
+ * Page header for the member tabs: the tab's artwork with its title.
+ * The motion follows the picture's own light: a copy of the image (screen blend) makes the red glow
+ * breathe, and a slow light pass (colour-dodge) only brightens what is already lit — dark areas stay still.
+ */
+export function TabHero({ art, title, sub }: { art: TabArt; title: ReactNode; sub?: ReactNode }) {
+  const src = `./media/tab-${art}.webp`;
+  return (
+    <header className={`tab-hero art-${art}`}>
+      <div className="tab-hero-art" aria-hidden="true">
+        <img className="tab-hero-img" src={src} alt="" decoding="async" />
+        <img className="tab-hero-glow" src={src} alt="" decoding="async" />
+        <span className="tab-hero-pass" />
+      </div>
+      <div className="tab-hero-text">
+        <h1 className="page-title">{title}</h1>
+        {sub && <p className="tab-hero-sub">{sub}</p>}
+      </div>
+    </header>
+  );
+}

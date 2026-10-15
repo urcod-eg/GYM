@@ -5,6 +5,7 @@ import { useApp, useServerAction } from '../../app/AppContext';
 import { LineChart } from '../../components/Charts';
 import { Icon } from '../../components/Icon';
 import { Shell, type NavItem } from '../../components/Shell';
+import { TabHero } from '../../components/Media';
 import { IllustrativeCode, Modal, Notice, PromoCard, VipBadge } from '../../components/ui';
 import { GYM_TZ, daysRemaining, lastUsableDay, phaseAt, type MembershipPhase } from '../../domain/dates';
 import { DEMO_BALANCES, DEMO_COACHES, DEMO_MEMBERS, DEMO_WEEK, DEMO_WEIGHT, DEMO_WORKOUT, memberDates, planById, type VipTier } from '../../mock/demo';
@@ -268,7 +269,7 @@ function ActiveHome() {
   const total = w.exercises.length;
   return (
     <div className="stack">
-      <h1 className="page-title">{t('member.hello', { name: first })}</h1>
+      <TabHero art="home" title={t('member.hello', { name: first })} />
       <BalanceNotice />
       {next ? (
         <Notice icon="calendar">{t('member.nextPeriod', { plan: lang === 'ar' ? next.planAr : next.planEn, date: fmtDate(next.start) })}</Notice>
@@ -400,6 +401,8 @@ function ExpiredView() {
 interface TodayWorkout {
   title: string;
   focus: string;
+  /** The coach planned something for today (a day with a title), even if no exercises are listed yet. */
+  hasDay: boolean;
   exercises: { name: string; sets: number; reps: string; rest: number; target: string }[];
   done: number[];
   toggle: (i: number) => void;
@@ -423,6 +426,7 @@ function useTodayWorkout(): TodayWorkout {
     return {
       title: lang === 'ar' ? DEMO_WORKOUT.titleAr : DEMO_WORKOUT.titleEn,
       focus: '',
+      hasDay: true,
       exercises: DEMO_WORKOUT.exercises.map((e) => ({ name: lang === 'ar' ? e.nameAr : e.nameEn, sets: e.sets, reps: e.reps, rest: e.rest, target: e.target })),
       done: demoDone,
       toggle: (i) => setDemoDone((d) => (d.includes(i) ? d.filter((x) => x !== i) : [...d, i])),
@@ -435,6 +439,7 @@ function useTodayWorkout(): TodayWorkout {
   return {
     title: plan?.title ?? '',
     focus: day?.focus ?? '',
+    hasDay: !!day,
     exercises: day?.exercises ?? [],
     done,
     toggle: (i) => {
@@ -451,11 +456,11 @@ function Workout() {
   const w = useTodayWorkout();
   return (
     <div className="stack">
-      <h1 className="page-title">{w.focus || w.title || t('member.todayWorkout')}</h1>
+      <TabHero art="workout" title={w.focus || w.title || t('member.todayWorkout')} sub={w.focus && w.title ? w.title : undefined} />
       {w.plan === null && !demoMode ? (
         <Notice icon="info">{t('member.noPlan')}</Notice>
       ) : w.exercises.length === 0 ? (
-        <Notice icon="info">{t('member.restDay')}</Notice>
+        <Notice icon="info">{t(w.hasDay ? 'member.noExercises' : 'member.restDay')}</Notice>
       ) : (
         <section className="card">
           {w.exercises.map((e, i) => (
@@ -626,7 +631,7 @@ function Progress() {
   };
   return (
     <div className="stack">
-      <h1 className="page-title">{t('member.progress')}</h1>
+      <TabHero art="progress" title={t('member.progress')} />
       <div className="grid-2">
         <div className="card stat">
           <span className="label">{t('member.weight')}</span>
@@ -680,7 +685,7 @@ function More() {
   ];
   return (
     <div className="stack">
-      <h1 className="page-title">{t('member.nav.more')}</h1>
+      <TabHero art="more" title={t('member.nav.more')} />
       <section className="card" style={{ padding: 8 }}>
         {items.map((it) =>
           it.href ? (
