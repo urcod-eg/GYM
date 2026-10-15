@@ -21,15 +21,11 @@ import { useStaff } from './StaffManager';
 
 function useMonth() {
   const [offset, setOffset] = useState(0);
-  const m = DateTime.now().setZone(GYM_TZ).startOf('month').minus({ months: offset });
-  return {
-    offset,
-    setOffset,
-    start: m,
-    end: m.plus({ months: 1 }),
-    fromIso: m.toISODate()!,
-    toIso: m.endOf('month').toISODate()!,
-  };
+  // Memoised: new DateTime objects on every render made the reports page reload in a loop.
+  return useMemo(() => {
+    const m = DateTime.now().setZone(GYM_TZ).startOf('month').minus({ months: offset });
+    return { offset, setOffset, start: m, end: m.plus({ months: 1 }), fromIso: m.toISODate()!, toIso: m.endOf('month').toISODate()! };
+  }, [offset]);
 }
 
 function MonthPicker({ month }: { month: ReturnType<typeof useMonth> }) {
@@ -420,7 +416,7 @@ export function ReportsPage() {
     return () => {
       alive = false;
     };
-  }, [month.fromIso, month.toIso, month.start, month.end]);
+  }, [month]);
 
   const r = state?.report;
   const dues = balances.reduce((s, b) => s + b.remaining, 0);

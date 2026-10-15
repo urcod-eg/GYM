@@ -1,3 +1,4 @@
+import { playDoorSound, setSoundsOn, soundsOn, unlockSounds } from '../../domain/sounds';
 import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { DateTime } from 'luxon';
 import { Link } from 'react-router-dom';
@@ -53,6 +54,8 @@ export function LiveScan() {
   const [busy, setBusy] = useState(false);
   const [code, setCode] = useState('');
   const [camOn, setCamOn] = useState(false);
+  const [picks, setPicks] = useState<typeof rows>([]);
+  const [sound, setSound] = useState(soundsOn);
   const lastText = useRef<{ text: string; at: number } | null>(null);
 
   const run = async (memberId: string, method: 'QR' | 'MANUAL', qrCode: string | null) => {
@@ -61,8 +64,9 @@ export function LiveScan() {
     try {
       const r = await data.checkInMember(actor, memberId, method, qrCode);
       setOutcome({ ...r, at: new Date() });
-      if (navigator.vibrate) navigator.vibrate(r.done ? 80 : [60, 60, 60]);
+      playDoorSound(r.done ? 'ok' : 'no');
     } catch (e) {
+      playDoorSound('no');
       setErr(errText(e));
       setOutcome(null);
     } finally {
@@ -76,7 +80,10 @@ export function LiveScan() {
     if (lastText.current && lastText.current.text === text && now - lastText.current.at < 4000) return;
     lastText.current = { text, at: now };
     const p = parseQr(text);
-    if (!p) return setErr(t('checkin.notOurs'));
+    if (!p) {
+      playDoorSound('no');
+      return setErr(t('checkin.notOurs'));
+    }
     if (!busy) run(p.memberId, 'QR', p.code);
   };
 
@@ -84,9 +91,19 @@ export function LiveScan() {
     e.preventDefault();
     const q = code.trim();
     if (!q) return;
-    const hit = rows.find((r) => r.m.code.toLowerCase() === q.toLowerCase()) ?? searchRows(rows, q)[0];
-    if (!hit) return setErr(t('app.noResults'));
-    run(hit.m.id, 'MANUAL', null);
+    unlockSounds();
+    setPicks([]);
+    // The exact member number or phone checks in at once; a name (or part of one) lists the matches
+    // so the cashier picks the right person instead of the first one found.
+    const digits = q.replace(/\D/g, '');
+    const exact = rows.find((r) => r.m.code.toLowerCase() === q.toLowerCase() || (digits.length >= 10 && ('0' + r.m.phone.slice(3)).endsWith(digits.slice(-10))));
+    if (exact) return run(exact.m.id, 'MANUAL', null);
+    const found = searchRows(rows, q).slice(0, 8);
+    if (!found.length) {
+      playDoorSound('no');
+      return setErr(t('app.noResults'));
+    }
+    setPicks(found);
   };
 
   const m = outcome?.member;
@@ -101,20 +118,67 @@ export function LiveScan() {
         {camOn ? (
           <Camera onText={onQr} onError={(e) => { setErr(e); setCamOn(false); }} />
         ) : (
-          <button className="scan-frame" onClick={() => setCamOn(true)} style={{ cursor: 'pointer', border: 0 }}>
+          <button className="scan-frame" onClick={() => { unlockSounds(); setCamOn(true); }} style={{ cursor: 'pointer', border: 0 }}>
             <span className="small" style={{ position: 'absolute', bottom: 14 }}>{t('checkin.startCamera')}</span>
           </button>
         )}
-        {camOn && (
-          <button className="btn btn-secondary btn-sm" style={{ alignSelf: 'flex-start' }} onClick={() => setCamOn(false)}>
-            {t('checkin.stopCamera')}
+        <div className="row wrap" style={{ gap: 8 }}>
+          {camOn && (
+            <button className="btn btn-secondary btn-sm" onClick={() => setCamOn(false)}>
+              {t('checkin.stopCamera')}
+            </button>
+          )}
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            aria-pressed={sound}
+            onClick={() => {
+              const next = !sound;
+              setSoundsOn(next);
+              setSound(next);
+              if (next) {
+                unlockSounds();
+                playDoorSound('ok');
+              }
+            }}
+          >
+            {sound ? '🔊' : '🔇'} {t(sound ? 'checkin.soundOn' : 'checkin.soundOff')}
           </button>
-        )}
+        </div>
         <form className="row" onSubmit={manual}>
           <input className="input ltr grow" placeholder="PLS-10001" value={code} onChange={(e) => setCode(e.target.value)} aria-label={t('scan.manual')} />
           <button className="btn btn-secondary" disabled={busy}>{t('checkin.manualDo')}</button>
         </form>
         <span className="hint">{t('checkin.manualHint')}</span>
+        {picks.length > 0 && (
+          <section className="card" style={{ padding: 6 }} aria-label={t('checkin.pick')}>
+            <span className="xs muted" style={{ padding: '4px 8px', display: 'block' }}>{t('checkin.pick')}</span>
+            {picks.map((r) => (
+              <button
+                key={r.m.id}
+                type="button"
+                className="list-item"
+                style={{ width: '100%', background: 'none', border: 0, cursor: 'pointer', textAlign: 'start', padding: '0 8px', font: 'inherit', color: 'inherit' }}
+                disabled={busy}
+                onClick={() => {
+                  unlockSounds();
+                  setPicks([]);
+                  setCode('');
+                  run(r.m.id, 'MANUAL', null);
+                }}
+              >
+                <Avatar name={r.m.name} />
+                <span className="grow">
+                  <strong>{r.m.name}</strong>
+                  <span className="muted small ltr" style={{ display: 'block' }}>
+                    {r.m.code} · {'0' + r.m.phone.slice(3)}
+                  </span>
+                </span>
+                <span className="btn btn-secondary btn-sm">{t('checkin.manualDo')}</span>
+              </button>
+            ))}
+          </section>
+        )}
         {err && <Notice tone="danger" icon="alert">{err}</Notice>}
       </section>
 
