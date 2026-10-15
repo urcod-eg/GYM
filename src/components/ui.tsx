@@ -8,10 +8,11 @@ import type { VipTier } from '../mock/demo';
 import { Icon, type IconName } from './Icon';
 import { mediaUrl, PhotoTile, PROMO_FIGURES } from './Media';
 
-export function StatusBadge({ phase, blocked, cancelled }: { phase: MembershipPhase; blocked?: boolean; cancelled?: boolean }) {
+export function StatusBadge({ phase, blocked, cancelled }: { phase: MembershipPhase | 'NONE'; blocked?: boolean; cancelled?: boolean }) {
   const { t } = useApp();
   if (cancelled) return <span className="badge badge-neutral">{t('status.CANCELLED')}</span>;
   if (blocked) return <span className="badge badge-danger">{t('status.BLOCKED')}</span>;
+  if (phase === 'NONE') return <span className="badge badge-neutral">{t('status.NONE')}</span>;
   const cls = phase === 'ACTIVE' ? 'badge-success' : phase === 'SCHEDULED' ? 'badge-info' : 'badge-neutral';
   return <span className={`badge ${cls}`}>{t(`status.${phase}`)}</span>;
 }
@@ -176,7 +177,9 @@ export function PromoCard({
   body,
   as = 'h3',
   large,
+  figure,
 }: {
+  figure?: { figure: import('./Media').Figure; tone: 'red' | 'gold' | 'blue' };
   variant: number;
   tag: string;
   tagTone?: 'primary' | 'vip' | 'info';
@@ -193,7 +196,7 @@ export function PromoCard({
         <Heading className="promo-title">{title}</Heading>
         <p className="promo-body">{body}</p>
       </div>
-      <PhotoTile {...PROMO_FIGURES[((variant % 4) + 4) % 4]} large={large} />
+      <PhotoTile {...(figure ?? PROMO_FIGURES[((variant % 4) + 4) % 4])} large={large} />
     </article>
   );
 }

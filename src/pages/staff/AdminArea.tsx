@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { DateTime } from 'luxon';
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { useApp, useServerAction } from '../../app/AppContext';
@@ -6,7 +6,7 @@ import { BarChart, LineChart } from '../../components/Charts';
 import { Icon } from '../../components/Icon';
 import { Shell, type NavItem } from '../../components/Shell';
 import { BalanceBadge, Modal, Notice, PlaceholderPage, Stat, StatusBadge, VipBadge } from '../../components/ui';
-import { useLedger } from '../../app/LedgerContext';
+import { useLedger, useRows } from '../../app/LedgerContext';
 import { GYM_TZ, daysRemaining, type MembershipPhase } from '../../domain/dates';
 import { formatEGP, type Plan } from '../../domain/plans';
 import { EMPTY_DRAFT, draftFromPlan, planFromDraft, validatePlan, type PlanDraft, type PlanErrors } from '../../domain/planForm';
@@ -14,12 +14,22 @@ import { usePlans } from '../../app/PlansContext';
 import { formatEgyptPhone } from '../../domain/text';
 import { DEMO_MEMBERS, DEMO_PAYMENTS, DEMO_PEAK_HOURS, DEMO_REVENUE_30D, type VipTier } from '../../mock/demo';
 import type { StringKey } from '../../i18n/strings';
-import { memberRows, searchRows } from './shared';
+import { searchRows } from './shared';
+import { demoMode } from '../../firebase/client';
+import * as data from '../../firebase/data';
+import { useActor } from '../../app/SessionContext';
+import { useErrorText } from '../../app/useErrorText';
+import { useTodayTotals } from './Money';
 import { DuesPage, SettingsPage, useDuesSummary } from './AdminDues';
 import { Link } from 'react-router-dom';
 import { AccountsPage } from './Accounts';
+import { BannersPage, PaymentsPage } from './AdminContent';
+import { AttendancePage, useTodayVisits, VipPage } from './Attendance';
+import { CoachesPage } from './Coaching';
+import { FinancePage, ReportsPage } from './Finance';
 import { StaffManager } from './StaffManager';
 import { AuditPage } from './AuditPage';
+import { SecurityPage } from './SecurityPage';
 
 export function AdminArea() {
   const { t } = useApp();
@@ -42,26 +52,26 @@ export function AdminArea() {
     { to: '/admin/settings', label: t('admin.settings'), icon: 'settings' },
   ];
   const later: [string, StringKey, number][] = [
-    ['payments', 'admin.payments', 3],
-    ['finance', 'admin.finance', 6],
-    ['attendance', 'admin.attendance', 4],
-    ['coaches', 'admin.coaches', 5],
-    ['vip', 'admin.vip', 4],
-    ['banners', 'admin.banners', 3],
-    ['reports', 'admin.reports', 6],
   ];
   return (
-    <Shell nav={nav} defaultTheme="light" showCloud title={t('role.admin')} livePaths={['/admin/accounts', '/admin/staff', '/admin/security', '/admin/audit']}>
+    <Shell nav={nav} defaultTheme="light" showCloud title={t('role.admin')} livePaths={['/admin$', '/admin/accounts', '/admin/staff', '/admin/security', '/admin/audit', '/admin/members', '/admin/plans', '/admin/dues', '/admin/settings', '/admin/payments', '/admin/banners', '/admin/attendance', '/admin/vip', '/admin/coaches', '/admin/finance', '/admin/reports']}>
       <Routes>
         <Route index element={<Dashboard />} />
         <Route path="accounts" element={<AccountsPage admin />} />
         <Route path="staff" element={<StaffManager />} />
-        <Route path="security" element={<AccountsPage admin initialFilter="blocked" />} />
+        <Route path="security" element={<SecurityPage />} />
         <Route path="audit" element={<AuditPage />} />
         <Route path="members" element={<Members />} />
         <Route path="plans" element={<Plans />} />
         <Route path="dues" element={<DuesPage />} />
         <Route path="settings" element={<SettingsPage />} />
+        <Route path="payments" element={<PaymentsPage />} />
+        <Route path="banners" element={<BannersPage />} />
+        <Route path="attendance" element={<AttendancePage />} />
+        <Route path="vip" element={<VipPage />} />
+        <Route path="coaches" element={<CoachesPage />} />
+        <Route path="finance" element={<FinancePage />} />
+        <Route path="reports" element={<ReportsPage />} />
         {later.map(([path, key, phase]) => (
           <Route key={path} path={path} element={<PlaceholderPage title={t(key)} phase={phase} />} />
         ))}
@@ -72,13 +82,126 @@ export function AdminArea() {
 }
 
 function Dashboard() {
+  return demoMode ? <DemoDashboard /> : <LiveDashboard />;
+}
+
+/** Live dashboard: today's receipts, running memberships, renewals due, balances, 30-day collections. */
+function LiveDashboard() {
+  const { t, lang, fmtNum, fmtDate } = useApp();
+  const actor = useActor();
+  const rows = useRows();
+  const { rows: loaded, settingsSaved } = useLedger();
+  const { empty: noPlans } = usePlans();
+  const day = useTodayTotals(actor.uid);
+  const visits = useTodayVisits();
+  const dues = useDuesSummary();
+  const now = DateTime.now().setZone(GYM_TZ);
+  const active = rows.filter((r) => r.phase === 'ACTIVE');
+  const none = rows.filter((r) => r.phase === 'NONE').length;
+  const expiring = active.filter((r) => r.end && !r.next && daysRemaining(now, r.end) <= 7).sort((a, b) => a.end!.toMillis() - b.end!.toMillis());
+  const [month, setMonth] = useState<{ date: string; amount: number }[] | null>(null);
+
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+    let cancelled = false;
+    const since = now.startOf('day').minus({ days: 29 });
+    data
+      .watchPaymentsSince(
+        since.toJSDate(),
+        (ps) => {
+          const days = Array.from({ length: 30 }, (_, i) => ({ date: since.plus({ days: i }).toISODate()!, amount: 0 }));
+          for (const p of ps) {
+            if (!p.at) continue;
+            const k = DateTime.fromJSDate(p.at).setZone(GYM_TZ).toISODate()!;
+            const d = days.find((x) => x.date === k);
+            if (d) d.amount += p.kind === 'REFUND' ? -p.amount : p.amount;
+          }
+          setMonth(days);
+        },
+        () => setMonth([]),
+      )
+      .then((u) => (cancelled ? u() : (stop = u)));
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  return (
+    <div className="stack">
+      <h1 className="page-title">{t('admin.dashboard')}</h1>
+      {noPlans && (
+        <Notice tone="warning" icon="tag">
+          <Link to="/admin/plans">{t('plans.empty')}</Link>
+        </Notice>
+      )}
+      {!settingsSaved && (
+        <Notice icon="settings">
+          <Link to="/admin/settings">{t('settings.notSaved')}</Link>
+        </Notice>
+      )}
+      <div className="grid-kpi">
+        <Stat label={t('admin.liveToday')} value={formatEGP(day.total, lang)} icon="wallet" delta={{ text: t('sale.todayCount', { n: fmtNum(day.count) }), up: true }} />
+        <Stat label={t('admin.liveActive')} value={loaded === null ? '…' : fmtNum(active.length)} icon="users" />
+        <Stat label={t('admin.todayVisits')} value={visits === null ? '…' : fmtNum(visits)} icon="clock" />
+        <Stat label={t('admin.liveNone')} value={loaded === null ? '…' : fmtNum(none)} icon="user" />
+        <Link to="/admin/dues" className="stat-link">
+          <Stat label={t('dues.total')} value={formatEGP(dues.total, lang)} icon="alert" delta={{ text: t('dues.lateCount', { n: dues.late }), up: false }} />
+        </Link>
+      </div>
+      <div className="grid-2" style={{ gridTemplateColumns: undefined }}>
+        <section className="card stack-sm">
+          <h2 className="card-title">{t('admin.revenue30')}</h2>
+          {month === null ? (
+            <p className="muted" aria-busy="true">…</p>
+          ) : (
+            <LineChart
+              ariaLabel={t('admin.revenue30')}
+              points={month.map((d) => ({ label: fmtDate(d.date, 'short'), value: d.amount / 100 }))}
+              formatValue={(n) => (n >= 1000 ? `${Math.round(n / 100) / 10}k` : String(n))}
+            />
+          )}
+        </section>
+        <section className="card stack-sm">
+          <div className="row-between">
+            <h2 className="card-title">{t('admin.liveExpiring')}</h2>
+            <span className="badge badge-warning no-dot">{expiring.length}</span>
+          </div>
+          {expiring.length === 0 ? (
+            <p className="muted small">—</p>
+          ) : (
+            <div className="list">
+              {expiring.map((r) => (
+                <div key={r.m.id} className="list-item">
+                  <div className="grow">
+                    <strong>{r.m.name}</strong>
+                    <div className="muted xs">
+                      {lang === 'ar' ? r.planAr : r.planEn} · {t('cashier.ends')} {fmtDate(r.lastDay, 'short')}
+                    </div>
+                  </div>
+                  <a className="btn btn-secondary btn-sm" target="_blank" rel="noreferrer" href={`https://wa.me/${r.m.phone.replace('+', '')}?text=${encodeURIComponent(t('admin.remindText', { name: r.m.name, date: fmtDate(r.lastDay) }))}`}>
+                    <Icon name="whatsapp" />
+                    {t('admin.remind')}
+                  </a>
+                </div>
+              ))}
+            </div>
+          )}
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function DemoDashboard() {
   const { t, lang, fmtNum, fmtDate } = useApp();
   const server = useServerAction();
-  const rows = useMemo(memberRows, []);
+  const rows = useRows();
   const now = DateTime.now().setZone(GYM_TZ);
   const active = rows.filter((r) => r.phase === 'ACTIVE');
   const vip = active.filter((r) => r.m.vip !== 'STANDARD').length;
-  const expiring = active.filter((r) => daysRemaining(now, r.end) <= 7).sort((a, b) => a.end.toMillis() - b.end.toMillis());
+  const expiring = active.filter((r) => r.end && daysRemaining(now, r.end) <= 7).sort((a, b) => a.end!.toMillis() - b.end!.toMillis());
   const today = DEMO_REVENUE_30D.at(-1)!.amount;
   const yesterday = DEMO_REVENUE_30D.at(-2)!.amount;
   const change = Math.round(((today - yesterday) / yesterday) * 100);
@@ -155,9 +278,9 @@ function Members() {
   const { isCancelled } = useLedger();
   const { plans } = usePlans();
   const server = useServerAction();
-  const all = useMemo(memberRows, []);
+  const all = useRows();
   const [q, setQ] = useState('');
-  const [status, setStatus] = useState<MembershipPhase | 'ALL'>('ALL');
+  const [status, setStatus] = useState<MembershipPhase | 'NONE' | 'ALL'>('ALL');
   const [vip, setVip] = useState<VipTier | 'ALL'>('ALL');
   const [plan, setPlan] = useState<string>('ALL');
   const [limit, setLimit] = useState(PAGE);
@@ -167,9 +290,9 @@ function Members() {
       searchRows(all, q)
         .filter((r) => status === 'ALL' || r.phase === status)
         .filter((r) => vip === 'ALL' || r.m.vip === vip)
-        .filter((r) => plan === 'ALL' || r.m.planId === plan)
+        .filter((r) => plan === 'ALL' || r.m.planId === plan || (!!r.planAr && plans.find((p) => p.id === plan)?.nameAr === r.planAr))
         .sort((a, b) => a.m.name.localeCompare(b.m.name, 'ar')),
-    [all, q, status, vip, plan],
+    [all, q, status, vip, plan, plans],
   );
   const shown = filtered.slice(0, limit);
   const dirty = q || status !== 'ALL' || vip !== 'ALL' || plan !== 'ALL';
@@ -195,9 +318,9 @@ function Members() {
           <input className="input" placeholder={t('cashier.searchPh')} value={q} onChange={(e) => setQ(e.target.value)} aria-label={t('cashier.searchPh')} />
         </div>
         <div className="grid-3">
-          <select className="select" value={status} onChange={(e) => setStatus(e.target.value as MembershipPhase | 'ALL')} aria-label={t('admin.filterStatus')}>
+          <select className="select" value={status} onChange={(e) => setStatus(e.target.value as MembershipPhase | 'NONE' | 'ALL')} aria-label={t('admin.filterStatus')}>
             <option value="ALL">{t('admin.filterStatus')}: {t('app.all')}</option>
-            {(['ACTIVE', 'SCHEDULED', 'EXPIRED'] as const).map((s) => (
+            {(['ACTIVE', 'SCHEDULED', 'EXPIRED', 'NONE'] as const).map((s) => (
               <option key={s} value={s}>{t(`status.${s}`)}</option>
             ))}
           </select>
@@ -257,7 +380,7 @@ function Members() {
                     </td>
                     <td data-label={t('admin.colCode')} className="ltr" style={{ textAlign: 'start' }}>{r.m.code}</td>
                     <td data-label={t('admin.colPhone')} className="ltr num" style={{ textAlign: 'start' }}>{formatEgyptPhone(r.m.phone)}</td>
-                    <td data-label={t('admin.colPlan')}>{lang === 'ar' ? r.planAr : r.planEn}</td>
+                    <td data-label={t('admin.colPlan')}>{(lang === 'ar' ? r.planAr : r.planEn) || '—'}</td>
                     <td data-label={t('admin.colEnds')} className="num">{fmtDate(r.lastDay, 'short')}</td>
                     <td data-label={t('admin.colCoach')}>{r.coach ?? '—'}</td>
                     <td>
@@ -287,10 +410,26 @@ function Members() {
 
 function Plans() {
   const { t, lang, toast } = useApp();
-  const { plans, upsert, remove } = usePlans();
+  const errText = useErrorText();
+  const { plans, upsert, remove, empty, seedDefaults } = usePlans();
   const [draft, setDraft] = useState<PlanDraft | null>(null);
   const [confirm, setConfirm] = useState<Plan | null>(null);
-  const usage = (id: string) => DEMO_MEMBERS.filter((m) => m.planId === id).length;
+  const [busy, setBusy] = useState(false);
+  // Live plans are never erased (sales point at them): "delete" pauses the plan.
+  const usage = (id: string) => (demoMode ? DEMO_MEMBERS.filter((m) => m.planId === id).length : 1);
+  const run = async (f: () => Promise<void>, ok: StringKey) => {
+    setBusy(true);
+    try {
+      await f();
+      toast(t(ok), 'success');
+      return true;
+    } catch (e) {
+      toast(errText(e), 'danger');
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
   const dur = (p: Plan) => {
     if (!p.duration) return t('dur.custom');
     if (p.duration.unit === 'session') return t('dur.session');
@@ -306,7 +445,16 @@ function Plans() {
           {t('admin.addPlan')}
         </button>
       </div>
-      <Notice icon="info">{t('plan.previewNote')}</Notice>
+      <Notice icon="info">{demoMode ? t('plan.previewNote') : t('plans.liveNote')}</Notice>
+      {empty && (
+        <section className="card stack-sm">
+          <p>{t('plans.empty')}</p>
+          <button className="btn btn-primary" style={{ alignSelf: 'flex-start' }} disabled={busy} aria-busy={busy} onClick={() => run(seedDefaults, 'plan.saved')}>
+            <Icon name="plus" />
+            {t('plans.seed')}
+          </button>
+        </section>
+      )}
       <div className="grid-4">
         {plans.map((p) => (
           <article key={p.id} className="card stack-sm plan-card" data-featured={p.featured || undefined} data-inactive={!p.active || undefined}>
@@ -346,10 +494,8 @@ function Plans() {
           draft={draft}
           plans={plans}
           onClose={() => setDraft(null)}
-          onSave={(d) => {
-            upsert(planFromDraft(d, () => `p_${Date.now().toString(36)}`));
-            setDraft(null);
-            toast(t('plan.saved'), 'success');
+          onSave={async (d) => {
+            if (await run(() => upsert(planFromDraft(d, () => `p_${Date.now().toString(36)}`)), 'plan.saved')) setDraft(null);
           }}
         />
       )}
@@ -364,15 +510,14 @@ function Plans() {
             {usage(confirm.id) > 0 ? (
               <>
                 <Notice tone="warning" icon="alert">
-                  {t('plan.inUseBody', { n: usage(confirm.id) })}
+                  {demoMode ? t('plan.inUseBody', { n: usage(confirm.id) }) : t('plans.pauseOnly')}
                 </Notice>
                 <div className="row wrap">
                   <button
                     className="btn btn-primary grow"
-                    onClick={() => {
-                      upsert({ ...confirm, active: false });
-                      setConfirm(null);
-                      toast(t('plan.deactivated'), 'success');
+                    disabled={busy}
+                    onClick={async () => {
+                      if (await run(() => remove(confirm.id), 'plan.deactivated')) setConfirm(null);
                     }}
                   >
                     {t('plan.deactivate')}
@@ -388,10 +533,8 @@ function Plans() {
                 <div className="row wrap">
                   <button
                     className="btn btn-danger-solid grow"
-                    onClick={() => {
-                      remove(confirm.id);
-                      setConfirm(null);
-                      toast(t('plan.deleted'), 'success');
+                    onClick={async () => {
+                      if (await run(() => remove(confirm.id), 'plan.deleted')) setConfirm(null);
                     }}
                   >
                     <Icon name="trash" />

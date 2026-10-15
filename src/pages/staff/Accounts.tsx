@@ -142,7 +142,7 @@ export function AccountsPage({ admin, initialFilter = 'all' }: { admin: boolean;
 
 type Dialog = null | 'activate' | 'reset' | 'block';
 
-function MemberCard({ m, admin, canWrite }: { m: MemberDoc; admin: boolean; canWrite: boolean }) {
+export function MemberCard({ m, admin, canWrite }: { m: MemberDoc; admin: boolean; canWrite: boolean }) {
   const { t, fmtDate, toast } = useApp();
   const actor = useActor();
   const errText = useErrorText();
@@ -278,7 +278,7 @@ function RegisterModal({ onClose, existing }: { onClose: () => void; existing: M
 
 /* ---------------------------------------------------------------- invite links */
 
-function InviteDialog({ m, purpose, onClose }: { m: MemberDoc; purpose: 'activate' | 'reset'; onClose: () => void }) {
+export function InviteDialog({ m, purpose, onClose, extra }: { m: MemberDoc; purpose: 'activate' | 'reset'; onClose: () => void; extra?: string }) {
   const { t } = useApp();
   const gym = useGym();
   const actor = useActor();
@@ -316,7 +316,7 @@ function InviteDialog({ m, purpose, onClose }: { m: MemberDoc; purpose: 'activat
   const appUrl = window.location.href.split('#')[0];
   const text = !password
     ? ''
-    : t(purpose === 'activate' ? 'cred.waMember' : 'cred.waReset', { gym: gym.nameAr, name: m.fullName, code: m.memberCode, url: appUrl, phone: formatEgyptPhone(m.phoneE164), password });
+    : t(purpose === 'activate' ? 'cred.waMember' : 'cred.waReset', { gym: gym.nameAr, name: m.fullName, code: m.memberCode, url: appUrl, phone: formatEgyptPhone(m.phoneE164), password }) + (extra ? `\n\n${extra}` : '');
 
   return (
     <Modal open onClose={onClose} title={purpose === 'activate' ? t('cred.title') : t('reset.title')}>

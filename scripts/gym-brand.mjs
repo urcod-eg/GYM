@@ -41,6 +41,14 @@ await square(512).png().toFile(path('public/icons/icon-512.png').pathname);
 await (await onBackground(512, 410)).toFile(path('public/icons/maskable-512.png').pathname);
 // iPhone shows transparency as black: always put the icon on the background colour.
 await (await onBackground(180, 160)).toFile(path('public/icons/apple-touch-icon.png').pathname);
+// Link preview card (WhatsApp, Facebook…): the logo centred on the background colour, 1200×630.
+{
+  const logo = await sharp(src.pathname).resize(440, 440, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } }).png().toBuffer();
+  await sharp({ create: { width: 1200, height: 630, channels: 4, background: cfg.iconBackground } })
+    .composite([{ input: logo, gravity: 'center' }])
+    .png()
+    .toFile(path('public/icons/og-image.png').pathname);
+}
 
 const manifest = {
   name: cfg.nameAr === cfg.nameEn ? cfg.nameAr : `${cfg.nameAr} — ${cfg.nameEn}`,

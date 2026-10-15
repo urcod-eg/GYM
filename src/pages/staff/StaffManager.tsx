@@ -21,7 +21,7 @@ const DEMO_STAFF: StaffAccount[] = [
   { uid: 's4', kind: 'staff', roles: ['cashier'], status: 'disabled', displayName: 'أحمد يوسف', phone: '+201534445556' },
 ];
 
-function useStaff() {
+export function useStaff() {
   const [rows, setRows] = useState<StaffAccount[] | null>(demoMode ? DEMO_STAFF : null);
   const [error, setError] = useState<unknown>(null);
   useEffect(() => {
@@ -37,7 +37,7 @@ function useStaff() {
   return { rows, error };
 }
 
-function useStaffStatus(): data.StaffStatus {
+export function useStaffStatus(): data.StaffStatus {
   const [st, setSt] = useState<data.StaffStatus>(demoMode ? { sessions: { s1: { at: new Date(), device: '' }, s2: { at: new Date(), device: '' } }, lockedUids: ['s3'] } : { sessions: {}, lockedUids: [] });
   useEffect(() => {
     if (demoMode) return;
@@ -96,7 +96,7 @@ export function StaffManager({ developer = false }: { developer?: boolean }) {
           ))}
         </div>
       )}
-      {inviting && <InviteStaff onClose={() => setInviting(false)} grantable={grantable} actorRoles={developer ? ['developer'] : roles} developer={developer} />}
+      {inviting && <InviteStaff onClose={() => setInviting(false)} grantable={grantable} actorRoles={developer ? ['developer'] : roles} developer={developer} allStaff={rows ?? []} />}
     </div>
   );
 }
@@ -294,8 +294,8 @@ function EditDialog({ s, grantable, actorRoles, onClose }: { s: StaffAccount; gr
 }
 
 /** New staff invite, or (with `target`) a new-password link for an existing staff account. */
-function InviteStaff({ onClose, grantable, actorRoles, developer, target }: { onClose: () => void; grantable: string[]; actorRoles: string[]; developer?: boolean; target?: StaffAccount }) {
-  const { t, lang } = useApp();
+function InviteStaff({ onClose, grantable, actorRoles, developer, target, allStaff = [] }: { onClose: () => void; grantable: string[]; actorRoles: string[]; developer?: boolean; target?: StaffAccount; allStaff?: StaffAccount[] }) {
+  const { t, lang, toast } = useApp();
   const gym = useGym();
   const actor = useActor();
   const errText = useErrorText();
@@ -306,12 +306,16 @@ function InviteStaff({ onClose, grantable, actorRoles, developer, target }: { on
   const [pin, setPin] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Same phone as an existing staff account: one person, one sign-in, several jobs.
+  const [owner, setOwner] = useState<StaffAccount | null>(null);
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     setErr(null);
     if (roles.length === 0) return setErr(t('staff.pickRole'));
     if (!target && !normalizeEgyptPhone(phone)) return setErr(t('err.invalid-phone'));
+    const existing = !target ? allStaff.find((x) => x.phone === normalizeEgyptPhone(phone)) : undefined;
+    if (existing) return setOwner(existing);
     if (demoMode) {
       setPin('4826');
       return setPassword('kxtr5839');
@@ -336,9 +340,55 @@ function InviteStaff({ onClose, grantable, actorRoles, developer, target }: { on
     ? t(target ? 'cred.waStaffReset' : 'cred.waStaff', { name, gym: gymName, roles: roleLabel(t, roles), url: window.location.href.split('#')[0], phone: formatEgyptPhone(e164), password, pin: pin ?? '', taps })
     : '';
 
+  const isDev = actorRoles.includes('developer');
+  // An admin account already opens the cashier, coach and accountant screens.
+  const coveredByAdmin = !!owner && owner.roles.includes('admin') && roles.every((r) => r !== 'admin');
+  const mergedRoles = owner ? [...new Set([...owner.roles, ...roles])].sort() : [];
+  const canMerge = !!owner && !coveredByAdmin && owner.uid !== actor.uid && (isDev || !owner.roles.includes('admin'));
+  const merge = async () => {
+    if (!owner) return;
+    if (demoMode) return toast(t('app.demoNoSave'));
+    setBusy(true);
+    setErr(null);
+    try {
+      await data.updateStaffAccount({ ...actor, roles: actorRoles }, owner, { roles: mergedRoles });
+      toast(t('staff.merged', { name: owner.displayName }), 'success');
+      onClose();
+    } catch (ex) {
+      setErr(errText(ex));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <Modal open onClose={onClose} title={target ? `${t('staff.reset')} — ${target.displayName}` : developer ? t('staff.inviteAdmin') : t('staff.invite')}>
-      {password ? (
+      {owner ? (
+        <div className="stack">
+          {coveredByAdmin ? (
+            <Notice tone="info" icon="shield">{t('staff.adminCovers', { name: owner.displayName })}</Notice>
+          ) : canMerge ? (
+            <>
+              <p>{t('staff.mergeBody', { name: owner.displayName, roles: roleLabel(t, owner.roles), add: roleLabel(t, roles.filter((r) => !owner.roles.includes(r))) })}</p>
+              <p className="small muted">{t('staff.mergeNote')}</p>
+            </>
+          ) : (
+            <Notice tone="warning" icon="alert">{t('staff.mergeDenied', { name: owner.displayName })}</Notice>
+          )}
+          {err && <span className="error" role="alert">{err}</span>}
+          <div className="row wrap">
+            {canMerge && (
+              <button className="btn btn-primary" onClick={merge} disabled={busy} aria-busy={busy}>
+                <Icon name="plus" />
+                {t('staff.mergeDo')}
+              </button>
+            )}
+            <button className="btn btn-ghost" onClick={() => (canMerge ? setOwner(null) : onClose())} disabled={busy}>
+              {canMerge ? t('app.back') : t('app.close')}
+            </button>
+          </div>
+        </div>
+      ) : password ? (
         <div className="stack">
           <Credentials phone={e164} password={password} pin={pin ?? undefined} text={text} />
         </div>

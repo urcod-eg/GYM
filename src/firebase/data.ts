@@ -7,6 +7,11 @@ import type { Unsubscribe } from 'firebase/firestore';
 import { firebase, secondaryFirebase } from './client';
 import { applyOps, commitOps, fromSdk } from './commit';
 import * as W from '../domain/writes';
+import * as S from '../domain/sales';
+import * as C from '../domain/content';
+import * as A from '../domain/attendance';
+import * as K from '../domain/coaching';
+import * as F from '../domain/finance';
 import { aliasId, hashPin, inviteIdOf, isInviteCode, newInviteCode, newLoginEmail, newPassword, newPin, newSalt, passwordProblem, type PersonKind } from '../domain/identity';
 import { normalizeEgyptPhone } from '../domain/text';
 
@@ -65,6 +70,12 @@ export interface MemberDoc {
   blocks: Record<string, W.BlockEntry>;
   searchTokens: string[];
   createdAt: Date | null;
+  /** Phase 3: the latest membership and any unpaid remainder (absent on files from before Phase 3). */
+  membership?: S.MembershipSummary | null;
+  balance?: S.BalanceDoc | null;
+  vipTierId?: 'PLUS' | 'ELITE' | null;
+  lastCheckInAt?: Date | null;
+  assignedCoachName?: string | null;
 }
 
 /** The signed-in member's own file. `blocked` when the rules refuse (login block or suspension). */
@@ -401,6 +412,409 @@ export async function watchStaff(cb: (rows: StaffAccount[]) => void, onError: (e
 export async function updateStaffAccount(actor: Actor, target: StaffAccount, change: { roles?: string[]; status?: 'active' | 'disabled'; displayName?: string }) {
   const [{ db }, auditId] = await Promise.all([firebase(), newId()]);
   await commitOps(db, W.updateStaff({ actorUid: actor.uid, actorRoles: actor.roles, auditId, target, ...change }));
+}
+
+// ------------------------------------------------------------------ wiping member data (developer)
+
+/**
+ * Deletes all member data after the developer re-enters the code + security phrase (checked by
+ * the rules, and counted like any attempt). Staff accounts, licence, branding and the audit log stay.
+ * Firebase sign-in records of members cannot be removed from a browser; without their profile and
+ * phone alias they can no longer sign in or read anything.
+ */
+export async function wipeMemberData(actor: Actor, devValue: string, onProgress?: (done: number, total: number) => void): Promise<W.WipeCounts> {
+  await enterPin(devValue);
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const [members, users, invites, memberships, payments] = await Promise.all([
+    fs.getDocs(fs.collection(db, 'members')),
+    fs.getDocs(fs.query(fs.collection(db, 'users'), fs.where('kind', '==', 'member'))),
+    fs.getDocs(fs.query(fs.collection(db, 'invites'), fs.where('kind', '==', 'member'))),
+    fs.getDocs(fs.collection(db, 'memberships')),
+    fs.getDocs(fs.collection(db, 'payments')),
+  ]);
+  const [checkins, tokens] = await Promise.all([fs.getDocs(fs.collection(db, 'checkins')), fs.getDocs(fs.collection(db, 'checkinTokens'))]);
+  const counts: W.WipeCounts = { members: members.size, accounts: users.size, invites: invites.size, memberships: memberships.size, payments: payments.size };
+  const [wipeId, auditId] = [fs.doc(fs.collection(db, 'wipes')).id, await newId()];
+  await commitOps(db, W.wipeRecord({ actorUid: actor.uid, auditId, wipeId, counts }));
+  const ops = W.wipeDeletes({
+    members: members.docs.map((d) => ({ id: d.id, phoneE164: String(d.data().phoneE164 ?? '') })),
+    memberUserUids: users.docs.map((d) => d.id),
+    memberInviteIds: invites.docs.map((d) => d.id),
+    membershipIds: memberships.docs.map((d) => d.id),
+    paymentIds: payments.docs.map((d) => d.id),
+    extraPaths: [
+      ...checkins.docs.map((d) => `checkins/${d.id}`),
+      ...tokens.docs.map((d) => `checkinTokens/${d.id}`),
+      // One document per member in each of these (id = member id).
+      ...members.docs.flatMap((d) => ['workoutPlans', 'nutritionPlans', 'workoutLogs', 'bodyLogs'].map((c) => `${c}/${d.id}`)),
+    ],
+  });
+  // Small batches: every delete is checked by the rules, which allow only a few document reads per request.
+  const chunks: (typeof ops)[] = [];
+  for (let i = 0; i < ops.length; i += 8) chunks.push(ops.slice(i, i + 8));
+  let done = 0;
+  const worker = async () => {
+    for (let c = chunks.shift(); c; c = chunks.shift()) {
+      await commitOps(db, c);
+      done += c.length;
+      onProgress?.(done, ops.length);
+    }
+  };
+  await Promise.all(Array.from({ length: 4 }, worker));
+  return counts;
+}
+
+// ------------------------------------------------------------------ Phase 3: plans, settings, sales
+
+const isAdminActor = (a: Actor) => a.roles.includes('admin') || a.roles.includes('developer');
+const docId = async (col: string) => {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  return fs.doc(fs.collection(db, col)).id;
+};
+
+export async function watchPlans(cb: (plans: (S.PlanDoc & { id: string })[]) => void, onError: (e: unknown) => void): Promise<Unsubscribe> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  return fs.onSnapshot(
+    fs.collection(db, 'plans'),
+    (s) => cb(s.docs.map((d) => ({ ...fromSdk<S.PlanDoc>(d.data()), id: d.id })).sort((a, b) => a.sort - b.sort)),
+    onError,
+  );
+}
+
+export async function savePlan(actor: Actor, planId: string, plan: S.PlanDoc) {
+  const [{ db }, auditId] = await Promise.all([firebase(), newId()]);
+  await commitOps(db, S.setPlan({ actorUid: actor.uid, auditId, planId, plan }));
+}
+
+/** Gym settings; `null` until an admin saves them once (the defaults apply meanwhile). */
+export async function watchSettings(cb: (s: S.GymSettingsDoc | null) => void, onError: (e: unknown) => void): Promise<Unsubscribe> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  return fs.onSnapshot(fs.doc(db, 'gymSettings', 'main'), (s) => cb(s.exists() ? fromSdk<S.GymSettingsDoc>(s.data()) : null), onError);
+}
+
+export async function saveSettings(actor: Actor, settings: S.GymSettingsDoc) {
+  const [{ db }, auditId] = await Promise.all([firebase(), newId()]);
+  await commitOps(db, S.setGymSettings({ actorUid: actor.uid, auditId, settings }));
+}
+
+export type SaleRequest = Omit<S.SaleInput, 'actorUid' | 'actorIsAdmin' | 'auditId' | 'membershipId' | 'paymentId' | 'receiptNo' | 'now'>;
+
+export async function sell(actor: Actor, req: SaleRequest) {
+  const { db } = await firebase();
+  const [auditId, membershipId, paymentId] = await Promise.all([newId(), docId('memberships'), docId('payments')]);
+  const now = new Date();
+  const r = S.sellMembership({ ...req, actorUid: actor.uid, actorIsAdmin: isAdminActor(actor), auditId, membershipId, paymentId, receiptNo: S.newReceiptNo(now), now });
+  await commitOps(db, r.ops);
+  return { membershipId, receiptNo: (r.ops[0] as W.WriteOp).data.receiptNo as string, quote: r.quote, startsAt: r.startsAt, endsAt: r.endsAt };
+}
+
+export async function payRemainder(actor: Actor, m: MemberDoc, amount: number, method: S.PayMethod, reference: string | null) {
+  const { db } = await firebase();
+  const [auditId, paymentId] = await Promise.all([newId(), docId('payments')]);
+  const receiptNo = S.newReceiptNo(new Date());
+  await commitOps(db, S.payBalance({ actorUid: actor.uid, auditId, paymentId, receiptNo, memberId: m.id, balance: m.balance ?? null, amount, method, reference }));
+  return receiptNo;
+}
+
+export async function setEntryPermission(actor: Actor, m: MemberDoc, untilDate: string | null, reason: string) {
+  const [{ db }, auditId] = await Promise.all([firebase(), newId()]);
+  await commitOps(db, S.grantEntry({ actorUid: actor.uid, auditId, memberId: m.id, balance: m.balance ?? null, untilDate, reason, now: new Date() }));
+}
+
+export interface MembershipRecord extends S.MembershipDoc {
+  id: string;
+  paidNow: number;
+  receiptNo: string;
+  createdAt: Date | null;
+}
+
+export async function readMembership(id: string): Promise<MembershipRecord | null> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const s = await fs.getDoc(fs.doc(db, 'memberships', id));
+  return s.exists() ? ({ ...fromSdk<Omit<MembershipRecord, 'id'>>(s.data()), id: s.id } as MembershipRecord) : null;
+}
+
+export async function cancelWithRefund(actor: Actor, m: MemberDoc, ms: MembershipRecord, refund: number, overridden: boolean, reason: string) {
+  const { db } = await firebase();
+  const [auditId, paymentId] = await Promise.all([newId(), docId('payments')]);
+  await commitOps(
+    db,
+    S.cancelMembership({
+      actorUid: actor.uid,
+      auditId,
+      membershipId: ms.id,
+      membership: ms,
+      member: { id: m.id, membership: m.membership ?? null, balance: m.balance ?? null },
+      refund,
+      overridden,
+      reason,
+      paymentId,
+      receiptNo: S.newReceiptNo(new Date()),
+      method: 'CASH',
+    }),
+  );
+}
+
+export interface PaymentRow {
+  id: string;
+  memberId: string;
+  membershipId: string | null;
+  kind: 'SALE' | 'BALANCE' | 'REFUND';
+  amount: number;
+  method: S.PayMethod;
+  reference: string | null;
+  receiptNo: string;
+  by: string;
+  at: Date | null;
+}
+
+/** Receipts since `since` (newest first), for the day's totals. One range filter: no custom index needed. */
+export async function watchPaymentsSince(since: Date, cb: (rows: PaymentRow[]) => void, onError: (e: unknown) => void, max = 500): Promise<Unsubscribe> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const q = fs.query(fs.collection(db, 'payments'), fs.where('at', '>=', since), fs.orderBy('at', 'desc'), fs.limit(max));
+  return fs.onSnapshot(q, (s) => cb(s.docs.map((d) => ({ ...fromSdk<Omit<PaymentRow, 'id'>>(d.data()), id: d.id }) as PaymentRow)), onError);
+}
+
+// ------------------------------------------------------------------ content: banners, VIP tiers
+
+export type BannerRow = C.BannerDoc & { id: string };
+
+/** All banners (admin) or only the published ones (everyone else). */
+export async function watchBanners(all: boolean, cb: (rows: BannerRow[]) => void, onError: (e: unknown) => void): Promise<Unsubscribe> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const col = fs.collection(db, 'banners');
+  const q = all ? col : fs.query(col, fs.where('status', '==', 'PUBLISHED'));
+  return fs.onSnapshot(q, (s) => cb(s.docs.map((d) => ({ ...fromSdk<C.BannerDoc>(d.data()), id: d.id })).sort((a, b) => a.sort - b.sort)), onError);
+}
+
+export async function saveBanner(actor: Actor, bannerId: string | null, banner: C.BannerDoc) {
+  const [{ db }, auditId, id] = await Promise.all([firebase(), newId(), bannerId ? Promise.resolve(bannerId) : docId('banners')]);
+  await commitOps(db, C.setBanner({ actorUid: actor.uid, auditId, bannerId: id, banner }));
+}
+
+export async function watchVipTiers(cb: (rows: Partial<Record<C.VipTierId, C.VipTierDoc>>) => void, onError: (e: unknown) => void): Promise<Unsubscribe> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  return fs.onSnapshot(fs.collection(db, 'vipTiers'), (s) => cb(Object.fromEntries(s.docs.map((d) => [d.id, fromSdk<C.VipTierDoc>(d.data())]))), onError);
+}
+
+export async function saveVipTier(actor: Actor, tier: C.VipTierId, doc: C.VipTierDoc) {
+  const [{ db }, auditId] = await Promise.all([firebase(), newId()]);
+  await commitOps(db, C.setVipTier({ actorUid: actor.uid, auditId, tier, doc }));
+}
+
+export async function setVip(actor: Actor, memberId: string, tier: C.VipTierId | null) {
+  const [{ db }, auditId] = await Promise.all([firebase(), newId()]);
+  await commitOps(db, C.setMemberVip({ actorUid: actor.uid, auditId, memberId, tier }));
+}
+
+// ------------------------------------------------------------------ Phase 4: check-in
+
+/** The member app: a fresh code every ~45 s (valid 90 s by server time, single use). */
+export async function writeMyCheckinCode(memberId: string): Promise<string> {
+  const { db } = await firebase();
+  const code = A.newCheckinCode();
+  await commitOps(db, A.writeToken(memberId, code));
+  return code;
+}
+
+export interface CheckinResult {
+  check: A.EntryCheck;
+  member: MemberDoc | null;
+  done: boolean;
+}
+
+/**
+ * The cashier's scan (or manual entry): reads the member file and the code from the server (never
+ * from the local cache), shows why entry is refused, and writes the check-in when it is allowed.
+ * The rules make the same decision again, so a modified browser cannot let anyone in.
+ */
+export async function checkInMember(actor: Actor, memberId: string, method: 'QR' | 'MANUAL', code: string | null): Promise<CheckinResult> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const [ms, ts] = await Promise.all([
+    fs.getDocFromServer(fs.doc(db, 'members', memberId)),
+    method === 'QR' ? fs.getDocFromServer(fs.doc(db, 'checkinTokens', memberId)).catch(() => null) : Promise.resolve(null),
+  ]);
+  if (!ms.exists()) return { check: { allowed: false, reason: 'NO_MEMBERSHIP', counts: false, visitsLeft: null, note: null }, member: null, done: false };
+  const member = { ...fromSdk<Omit<MemberDoc, 'id'>>(ms.data()), id: ms.id } as MemberDoc;
+  const token = method === 'QR' ? { code: code ?? '', doc: ts && ts.exists() ? fromSdk<A.TokenDoc>(ts.data()) : null } : null;
+  // The server's clock decides; this local check only explains a refusal.
+  const check = A.checkEntry({ id: member.id, membership: member.membership, balance: member.balance, blocks: member.blocks, lastCheckInAt: member.lastCheckInAt }, new Date(), token);
+  if (!check.allowed) return { check, member, done: false };
+  const checkinId = fs.doc(fs.collection(db, 'checkins')).id;
+  await commitOps(db, A.checkIn({ actorUid: actor.uid, checkinId, member: { id: member.id, membership: member.membership, balance: member.balance, blocks: member.blocks, lastCheckInAt: member.lastCheckInAt }, method, code, counts: check.counts }));
+  return { check, member, done: true };
+}
+
+export interface CheckinRow {
+  id: string;
+  memberId: string;
+  method: 'QR' | 'MANUAL';
+  by: string;
+  at: Date | null;
+}
+
+export async function watchCheckinsSince(since: Date, cb: (rows: CheckinRow[]) => void, onError: (e: unknown) => void, max = 2000): Promise<Unsubscribe> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const q = fs.query(fs.collection(db, 'checkins'), fs.where('at', '>=', since), fs.orderBy('at', 'desc'), fs.limit(max));
+  return fs.onSnapshot(q, (s) => cb(s.docs.map((d) => ({ ...fromSdk<Omit<CheckinRow, 'id'>>(d.data()), id: d.id }) as CheckinRow)), onError);
+}
+
+// ------------------------------------------------------------------ Phase 5: coaches and programmes
+
+export async function assignMemberCoach(actor: Actor, memberId: string, coach: { uid: string; name: string } | null) {
+  const [{ db }, auditId] = await Promise.all([firebase(), newId()]);
+  await commitOps(db, K.assignCoach({ actorUid: actor.uid, auditId, memberId, coach }));
+}
+
+/** A coach's own trainees (the rules allow exactly this query). */
+export async function watchMyTrainees(uid: string, cb: (rows: MemberDoc[]) => void, onError: (e: unknown) => void): Promise<Unsubscribe> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const q = fs.query(fs.collection(db, 'members'), fs.where('assignedCoachId', '==', uid));
+  return fs.onSnapshot(q, (s) => cb(s.docs.map((d) => ({ ...fromSdk<Omit<MemberDoc, 'id'>>(d.data()), id: d.id }) as MemberDoc)), onError);
+}
+
+/** One per-member document (plan, nutrition, logs): null when missing or not readable. */
+export async function watchMemberDoc<T>(collection: 'workoutPlans' | 'nutritionPlans' | 'workoutLogs' | 'bodyLogs', memberId: string, cb: (d: T | null) => void): Promise<Unsubscribe> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  return fs.onSnapshot(
+    fs.doc(db, collection, memberId),
+    (s) => cb(s.exists() ? fromSdk<T>(s.data()) : null),
+    () => cb(null),
+  );
+}
+
+export async function saveWorkoutPlan(actor: Actor, memberId: string, coachId: string, plan: K.WorkoutPlan) {
+  const { db } = await firebase();
+  await commitOps(db, K.setWorkoutPlan({ actorUid: actor.uid, memberId, coachId, plan }));
+}
+
+export async function saveNutritionPlan(actor: Actor, memberId: string, coachId: string, plan: K.NutritionPlan) {
+  const { db } = await firebase();
+  await commitOps(db, K.setNutritionPlan({ actorUid: actor.uid, memberId, coachId, plan }));
+}
+
+export async function saveWorkoutDay(memberId: string, days: Record<string, number[]>, date: string, done: number[]) {
+  const { db } = await firebase();
+  await commitOps(db, K.setWorkoutDay({ memberId, days, date, done }));
+}
+
+export async function saveWeight(memberId: string, entries: K.WeightEntry[], date: string, kg: number) {
+  const { db } = await firebase();
+  await commitOps(db, K.addWeight({ memberId, entries, date, kg }));
+}
+
+export type LibraryRow = K.LibraryExercise & { id: string };
+
+export async function watchExercises(cb: (rows: LibraryRow[]) => void, onError: (e: unknown) => void): Promise<Unsubscribe> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  return fs.onSnapshot(fs.collection(db, 'exercises'), (s) => cb(s.docs.map((d) => ({ ...fromSdk<K.LibraryExercise>(d.data()), id: d.id })).sort((a, b) => a.nameAr.localeCompare(b.nameAr, 'ar'))), onError);
+}
+
+export async function saveExercise(actor: Actor, id: string | null, doc: K.LibraryExercise) {
+  const [{ db }, newDocId] = await Promise.all([firebase(), id ? Promise.resolve(id) : docId('exercises')]);
+  await commitOps(db, K.setLibraryExercise({ actorUid: actor.uid, id: newDocId, doc }));
+}
+
+export async function deleteExercise(id: string) {
+  const { db } = await firebase();
+  await commitOps(db, [{ type: 'delete', path: `exercises/${id}` }]);
+}
+
+/** The signed-in member's own check-ins (newest first). */
+export async function readMyCheckins(memberId: string): Promise<Date[]> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const s = await fs.getDocs(fs.query(fs.collection(db, 'checkins'), fs.where('memberId', '==', memberId), fs.limit(200)));
+  return s.docs.map((d) => fromSdk<{ at: Date }>(d.data()).at).filter(Boolean);
+}
+
+// ------------------------------------------------------------------ Phase 6: books, cash, reports
+
+export interface FinanceRow extends F.FinanceEntryInput {
+  id: string;
+  status: 'ACTIVE' | 'VOID';
+  voidReason: string;
+  by: string;
+  at: Date | null;
+}
+
+export async function addEntry(actor: Actor, entry: F.FinanceEntryInput) {
+  const [{ db }, auditId, entryId] = await Promise.all([firebase(), newId(), docId('financeEntries')]);
+  await commitOps(db, F.addFinanceEntry({ actorUid: actor.uid, auditId, entryId, entry }));
+}
+
+export async function voidEntry(actor: Actor, entryId: string, reason: string) {
+  const [{ db }, auditId] = await Promise.all([firebase(), newId()]);
+  await commitOps(db, F.voidFinanceEntry({ actorUid: actor.uid, auditId, entryId, reason }));
+}
+
+/** Entries whose gym day is in [from, to] ('YYYY-MM-DD'). */
+export async function watchEntries(from: string, to: string, cb: (rows: FinanceRow[]) => void, onError: (e: unknown) => void): Promise<Unsubscribe> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const q = fs.query(fs.collection(db, 'financeEntries'), fs.where('date', '>=', from), fs.where('date', '<=', to), fs.orderBy('date', 'desc'));
+  return fs.onSnapshot(q, (s) => cb(s.docs.map((d) => ({ ...fromSdk<Omit<FinanceRow, 'id'>>(d.data()), id: d.id }) as FinanceRow)), onError);
+}
+
+export interface CashCloseRow {
+  id: string;
+  date: string;
+  by: string;
+  expected: number;
+  counted: number;
+  diff: number;
+  note: string;
+  at: Date | null;
+}
+
+export async function closeMyCash(actor: Actor, date: string, expected: number, counted: number, note: string) {
+  const [{ db }, auditId] = await Promise.all([firebase(), newId()]);
+  await commitOps(db, F.closeCash({ actorUid: actor.uid, auditId, date, expected, counted, note }));
+}
+
+export async function readMyClose(uid: string, date: string): Promise<CashCloseRow | null> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const s = await fs.getDoc(fs.doc(db, 'cashCloses', `${uid}_${date}`)).catch(() => null);
+  return s && s.exists() ? ({ ...fromSdk<Omit<CashCloseRow, 'id'>>(s.data()), id: s.id } as CashCloseRow) : null;
+}
+
+export async function watchCashCloses(from: string, to: string, cb: (rows: CashCloseRow[]) => void, onError: (e: unknown) => void): Promise<Unsubscribe> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const q = fs.query(fs.collection(db, 'cashCloses'), fs.where('date', '>=', from), fs.where('date', '<=', to), fs.orderBy('date', 'desc'));
+  return fs.onSnapshot(q, (s) => cb(s.docs.map((d) => ({ ...fromSdk<Omit<CashCloseRow, 'id'>>(d.data()), id: d.id }) as CashCloseRow)), onError);
+}
+
+export interface MembershipLite {
+  id: string;
+  memberId: string;
+  renewal?: boolean;
+  plan: { code: string; nameAr: string; nameEn: string };
+  status: string;
+  due: number;
+  paidNow: number;
+  createdAt: Date | null;
+}
+
+/** Everything a monthly report needs, read once: receipts, memberships sold, entries, visits count. */
+export async function readMonth(start: Date, end: Date, fromIso: string, toIso: string) {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const [pays, mss, ents, visits] = await Promise.all([
+    fs.getDocs(fs.query(fs.collection(db, 'payments'), fs.where('at', '>=', start), fs.where('at', '<', end))),
+    fs.getDocs(fs.query(fs.collection(db, 'memberships'), fs.where('createdAt', '>=', start), fs.where('createdAt', '<', end))),
+    fs.getDocs(fs.query(fs.collection(db, 'financeEntries'), fs.where('date', '>=', fromIso), fs.where('date', '<=', toIso))).catch(() => null),
+    fs.getCountFromServer(fs.query(fs.collection(db, 'checkins'), fs.where('at', '>=', start), fs.where('at', '<', end))).then((c) => c.data().count).catch(() => null),
+  ]);
+  return {
+    payments: pays.docs.map((d) => ({ ...fromSdk<Omit<PaymentRow, 'id'>>(d.data()), id: d.id }) as PaymentRow),
+    memberships: mss.docs.map((d) => ({ ...fromSdk<Omit<MembershipLite, 'id'>>(d.data()), id: d.id }) as MembershipLite),
+    entries: ents ? ents.docs.map((d) => ({ ...fromSdk<Omit<FinanceRow, 'id'>>(d.data()), id: d.id }) as FinanceRow) : null,
+    visits,
+  };
+}
+
+/** The signed-in member's own receipts (newest first). */
+export async function readMyPayments(memberId: string): Promise<PaymentRow[]> {
+  const [{ db }, fs] = await Promise.all([firebase(), fsMod()]);
+  const s = await fs.getDocs(fs.query(fs.collection(db, 'payments'), fs.where('memberId', '==', memberId), fs.limit(100)));
+  return s.docs.map((d) => ({ ...fromSdk<Omit<PaymentRow, 'id'>>(d.data()), id: d.id }) as PaymentRow).sort((a, b) => (b.at?.getTime() ?? 0) - (a.at?.getTime() ?? 0));
 }
 
 // ------------------------------------------------------------------ licence & branding

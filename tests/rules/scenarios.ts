@@ -25,9 +25,30 @@ import {
   openStaffSession,
   endStaffSession,
   unlockPin,
+  wipeRecord,
+  wipeDeletes,
   type InviteDoc,
   type WriteOp,
 } from '../../src/domain/writes';
+import {
+  cancelMembership,
+  DEFAULT_GYM_SETTINGS,
+  grantEntry,
+  newReceiptNo,
+  payBalance,
+  sellMembership,
+  setGymSettings,
+  setPlan,
+  type BalanceDoc,
+  type MembershipSummary,
+  type PlanDoc,
+  type SaleInput,
+} from '../../src/domain/sales';
+import { DateTime } from 'luxon';
+import { setBanner, setVipTier, setMemberVip, type BannerDoc } from '../../src/domain/content';
+import { checkIn, writeToken, type EntryMember } from '../../src/domain/attendance';
+import { addFinanceEntry, closeCash, voidFinanceEntry } from '../../src/domain/finance';
+import { addWeight, assignCoach, setLibraryExercise, setNutritionPlan, setWorkoutDay, setWorkoutPlan, type WorkoutPlan } from '../../src/domain/coaching';
 
 export interface AuthSpec {
   uid: string;
@@ -105,8 +126,17 @@ function world(now: number): Record<string, Data> {
     'members/mem3': { ...member('mem3', 10003, 'كريم', PHONE_MEM3, 'u-mem3', null), blocks: { LOGIN_BLOCK: { reasonCode: 'MISCONDUCT', note: '', until: null, by: 'admin1', at: new Date(now) } } },
     'users/u-mem3': { kind: 'member', roles: ['member'], status: 'active', displayName: 'كريم', phone: PHONE_MEM3, memberId: 'mem3', inviteId: 'seed', createdAt: new Date(now) },
     'auditLogs/seed-a': { actorUid: 'cash1', action: 'member.register', entityType: 'members', entityId: 'mem1', at: new Date(now), summary: {} },
+    'plans/p_m1': { ...PLAN_M1, updatedAt: new Date(now), lastAuditId: 'seed-pl1' },
+    'plans/p_day': { ...PLAN_DAY, updatedAt: new Date(now), lastAuditId: 'seed-pl2' },
+    'plans/p_custom': { ...PLAN_CUSTOM, updatedAt: new Date(now), lastAuditId: 'seed-pl3' },
+    'gymSettings/main': { ...DEFAULT_GYM_SETTINGS, updatedAt: new Date(now), lastAuditId: 'seed-gs' },
   };
 }
+
+const PLAN_M1: PlanDoc = { code: 'M1', nameAr: 'شهر', nameEn: '1 month', unit: 'month', value: 1, visitQuota: null, price: 100000, featured: false, active: true, sort: 1 };
+const PLAN_DAY: PlanDoc = { code: 'DAY', nameAr: 'حصة يوم', nameEn: 'Day pass', unit: 'session', value: 1, visitQuota: 1, price: 10000, featured: false, active: true, sort: 0 };
+const PLAN_CUSTOM: PlanDoc = { code: 'CUSTOM', nameAr: 'مدة مخصصة', nameEn: 'Custom', unit: 'custom', value: 1, visitQuota: null, price: 0, featured: false, active: true, sort: 9 };
+const cairoToday = (plusDays = 0) => DateTime.now().setZone('Africa/Cairo').plus({ days: plusDays }).toISODate()!;
 
 function member(id: string, no: number, name: string, phone: string, authUid: string | null, coach: string | null) {
   return {
@@ -533,6 +563,453 @@ export function defineScenarios(name: string, h: Harness) {
       });
     });
 
+    describe('Phase 6: books and cash', () => {
+      const entry = { kind: 'EXPENSE' as const, category: 'rent' as const, amount: 1500000, method: 'BANK' as const, date: '2026-10-01', note: 'إيجار أكتوبر' };
+      it('the accountant and the admin record expenses; a cashier cannot; nobody edits or deletes them', async () => {
+        await ok(h.as(ACCOUNTANT).commit(addFinanceEntry({ actorUid: 'acc1', auditId: nextId('fe-'), entryId: 'fe1', entry })));
+        await ok(h.as(ADMIN).commit(addFinanceEntry({ actorUid: 'admin1', auditId: nextId('fe-'), entryId: 'fe2', entry: { ...entry, kind: 'INCOME', category: 'products', amount: 25000 } })));
+        await denied(h.as(CASHIER).commit(addFinanceEntry({ actorUid: 'cash1', auditId: nextId('fe-'), entryId: 'fe3', entry })));
+        await denied(h.as(ADMIN).commit([{ type: 'update', path: 'financeEntries/fe1', data: { amount: 1 } }]));
+        await denied(h.as(ADMIN).commit([{ type: 'delete', path: 'financeEntries/fe1' }]));
+      });
+      it('a wrong category or amount is refused', async () => {
+        const ops = addFinanceEntry({ actorUid: 'acc1', auditId: 'fe-x', entryId: 'fe4', entry });
+        (ops[0].data as Record<string, unknown>).category = 'products';
+        await denied(h.as(ACCOUNTANT).commit(ops));
+        const neg = addFinanceEntry({ actorUid: 'acc1', auditId: 'fe-y', entryId: 'fe5', entry });
+        (neg[0].data as Record<string, unknown>).amount = -5;
+        await denied(h.as(ACCOUNTANT).commit(neg));
+      });
+      it('only an admin voids an entry, with a reason, once', async () => {
+        await ok(h.as(ACCOUNTANT).commit(addFinanceEntry({ actorUid: 'acc1', auditId: nextId('fe-'), entryId: 'fe6', entry })));
+        await denied(h.as(ACCOUNTANT).commit(voidFinanceEntry({ actorUid: 'acc1', auditId: nextId('fv-'), entryId: 'fe6', reason: 'غلط' })));
+        await ok(h.as(ADMIN).commit(voidFinanceEntry({ actorUid: 'admin1', auditId: nextId('fv-'), entryId: 'fe6', reason: 'اتسجل مرتين' })));
+        await denied(h.as(ADMIN).commit(voidFinanceEntry({ actorUid: 'admin1', auditId: nextId('fv-'), entryId: 'fe6', reason: 'تاني' })));
+      });
+      it('a cashier closes their own drawer once a day; the difference is computed, not typed', async () => {
+        await ok(h.as(CASHIER).commit(closeCash({ actorUid: 'cash1', auditId: nextId('cc-'), date: '2026-10-15', expected: 500000, counted: 490000, note: '' })));
+        await denied(h.as(CASHIER).commit(closeCash({ actorUid: 'cash1', auditId: nextId('cc-'), date: '2026-10-15', expected: 500000, counted: 500000, note: '' })));
+        const fake = closeCash({ actorUid: 'cash1', auditId: 'cc-x', date: '2026-10-16', expected: 500000, counted: 490000, note: '' });
+        (fake[0].data as Record<string, unknown>).diff = 0;
+        await denied(h.as(CASHIER).commit(fake));
+        const other = closeCash({ actorUid: 'cash1', auditId: 'cc-y', date: '2026-10-17', expected: 0, counted: 0, note: '' });
+        (other[0] as { path: string }).path = 'cashCloses/admin1_2026-10-17';
+        (other[1].data as Record<string, unknown>).entityId = 'admin1_2026-10-17';
+        await denied(h.as(CASHIER).commit(other));
+      });
+    });
+
+    describe('Phase 5: coaches and programmes', () => {
+      const plan: WorkoutPlan = { title: 'تضخيم', days: [{ day: 0, focus: 'صدر', exercises: [{ name: 'بنش', sets: 4, reps: '8-10', rest: 90, target: '60 kg' }] }], notes: '' };
+      it('the assigned coach writes the plan; another coach or a cashier cannot', async () => {
+        await ok(h.as(COACH).commit(setWorkoutPlan({ actorUid: 'coach1', memberId: 'mem1', coachId: 'coach1', plan })));
+        await ok(h.as(COACH).commit(setNutritionPlan({ actorUid: 'coach1', memberId: 'mem1', coachId: 'coach1', plan: { title: 'تغذية', meals: [{ name: 'فطار', items: 'بيض وشوفان' }], notes: '' } })));
+        await denied(h.as(COACH).commit(setWorkoutPlan({ actorUid: 'coach1', memberId: 'mem2', coachId: 'coach1', plan })));
+        await denied(h.as(CASHIER).commit(setWorkoutPlan({ actorUid: 'cash1', memberId: 'mem1', coachId: 'cash1', plan })));
+        await ok(h.as(ADMIN).commit(setWorkoutPlan({ actorUid: 'admin1', memberId: 'mem2', coachId: 'coach1', plan })));
+      });
+      it('the member reads their own plan, not someone else\'s', async () => {
+        await ok(h.as(COACH).commit(setWorkoutPlan({ actorUid: 'coach1', memberId: 'mem1', coachId: 'coach1', plan })));
+        await ok(h.as(MEMBER1).get('workoutPlans/mem1'));
+        await h.seed({ 'workoutPlans/mem3': { memberId: 'mem3', coachId: 'coach1', title: 'x', days: [], notes: '', updatedAt: new Date(), by: 'coach1' } });
+        await denied(h.as(MEMBER1).get('workoutPlans/mem3'));
+      });
+      it('members log their own workouts and weight only; the coach reads them', async () => {
+        await ok(h.as(MEMBER1).commit(setWorkoutDay({ memberId: 'mem1', days: {}, date: '2026-10-15', done: [0, 1] })));
+        await ok(h.as(MEMBER1).commit(addWeight({ memberId: 'mem1', entries: [], date: '2026-10-15', kg: 84.2 })));
+        await denied(h.as(MEMBER3).commit(setWorkoutDay({ memberId: 'mem1', days: {}, date: '2026-10-15', done: [0] })));
+        await ok(h.as(COACH).get('workoutLogs/mem1'));
+        await ok(h.as(COACH).get('bodyLogs/mem1'));
+        await denied(h.as(CASHIER).get('bodyLogs/mem1'));
+        // Another coach does not see this coach's trainee.
+        await h.seed({ 'users/coach2': staffUser(['coach'], '+201500000009'), 'staffSessions/coach2': session(Date.now()) });
+        await denied(h.as({ uid: 'coach2', email: semail(9) }).get('bodyLogs/mem1'));
+      });
+      it('only the admin assigns a coach, and only to a real coach account', async () => {
+        await ok(h.as(ADMIN).commit(assignCoach({ actorUid: 'admin1', auditId: nextId('ac-'), memberId: 'mem2', coach: { uid: 'coach1', name: 'موظف' } })));
+        expect((await h.peek('members/mem2'))?.assignedCoachId).toBe('coach1');
+        await denied(h.as(ADMIN).commit(assignCoach({ actorUid: 'admin1', auditId: nextId('ac-'), memberId: 'mem2', coach: { uid: 'cash1', name: 'موظف' } })));
+        await denied(h.as(CASHIER).commit(assignCoach({ actorUid: 'cash1', auditId: nextId('ac-'), memberId: 'mem2', coach: { uid: 'coach1', name: 'موظف' } })));
+      });
+      it('coaches build the exercise library; members cannot', async () => {
+        await ok(h.as(COACH).commit(setLibraryExercise({ actorUid: 'coach1', id: 'bench', doc: { nameAr: 'بنش برس', nameEn: 'Bench press', muscle: 'chest', tips: '' } })));
+        await denied(h.as(MEMBER1).commit(setLibraryExercise({ actorUid: 'u-mem1', id: 'squat', doc: { nameAr: 'سكوات', nameEn: 'Squat', muscle: 'legs', tips: '' } })));
+      });
+    });
+
+    describe('Phase 4: check-in at the door', () => {
+      const H1 = 3600_000;
+      const summary = (over: Partial<MembershipSummary> = {}): MembershipSummary => ({
+        id: 'ms-x', planNameAr: 'شهر', planNameEn: '1 month', unit: 'month',
+        startsAt: new Date(Date.now() - 5 * D), endsAt: new Date(Date.now() + 20 * D), status: 'ACTIVE', visitQuota: null, visitsUsed: 0, prev: null, ...over,
+      });
+      const MEMBER2 = { uid: 'u-mem2', email: email(2) };
+      const seedMember = async (over: Record<string, unknown> = {}) => {
+        await h.seed({
+          'members/mem2': { ...member('mem2', 10002, 'سارة محمود', PHONE_MEM2, 'u-mem2', null), membership: summary(), balance: null, lastPaymentId: null, lastCheckInAt: null, lastCheckinId: null, ...over },
+          'users/u-mem2': { kind: 'member', roles: ['member'], status: 'active', displayName: 'سارة', phone: PHONE_MEM2, memberId: 'mem2', inviteId: 'seed', createdAt: new Date() },
+        });
+      };
+      const em = async (): Promise<EntryMember> => {
+        const m = (await h.peek('members/mem2')) as Record<string, unknown>;
+        const toDate = (v: unknown) => (v == null ? null : v instanceof Date ? v : (v as { toDate(): Date }).toDate());
+        const c = m.membership as Record<string, unknown>;
+        return {
+          id: 'mem2',
+          membership: { ...(c as unknown as MembershipSummary), startsAt: toDate(c.startsAt)!, endsAt: toDate(c.endsAt)!, prev: null },
+          balance: null,
+          blocks: {},
+          lastCheckInAt: toDate(m.lastCheckInAt),
+        };
+      };
+      const scan = async (who: AuthSpec, code: string, counts = false) =>
+        h.as(who).commit(checkIn({ actorUid: who.uid, checkinId: nextId('ci-'), member: await em(), method: 'QR', code, counts }) as Op[]);
+
+      it('the member writes a code; the cashier scans it once; a second scan of the same code is refused', async () => {
+        await seedMember();
+        await ok(h.as(MEMBER2).commit(writeToken('mem2', 'ABCD2345')));
+        await ok(scan(CASHIER, 'ABCD2345'));
+        expect((await h.peek('members/mem2'))?.lastCheckinId).toBeTruthy();
+        await h.seed({ 'members/mem2': { ...((await h.peek('members/mem2')) as Record<string, unknown>), lastCheckInAt: new Date(Date.now() - H1) } });
+        await denied(scan(CASHIER, 'ABCD2345'));
+      });
+      it('a wrong or stale code is refused; a member cannot write someone else\'s code', async () => {
+        await seedMember();
+        await ok(h.as(MEMBER2).commit(writeToken('mem2', 'ABCD2345')));
+        await denied(scan(CASHIER, 'ZZZZ2345'));
+        await h.seed({ 'checkinTokens/mem2': { code: 'ABCD2345', at: new Date(Date.now() - 5 * 60_000), usedAt: null } });
+        await denied(scan(CASHIER, 'ABCD2345'));
+        await denied(h.as(MEMBER1).commit(writeToken('mem2', 'HACK2345')));
+      });
+      it('no entry when expired, not started, blocked, or with a late balance (unless an admin allowed it)', async () => {
+        const manual = async () => h.as(CASHIER).commit(checkIn({ actorUid: 'cash1', checkinId: nextId('ci-'), member: await em(), method: 'MANUAL', code: null, counts: false }) as Op[]);
+        await seedMember({ membership: summary({ startsAt: new Date(Date.now() - 40 * D), endsAt: new Date(Date.now() - D) }) });
+        await denied(manual());
+        await seedMember({ membership: summary({ startsAt: new Date(Date.now() + 2 * D), endsAt: new Date(Date.now() + 30 * D) }) });
+        await denied(manual());
+        await seedMember({ blocks: { CHECKIN_BLOCK: { reasonCode: 'X', note: '', until: null, by: 'admin1', at: new Date() } } });
+        await denied(manual());
+        const late = { remaining: 500, total: 1000, dueAt: new Date(Date.now() - H1), membershipId: 'ms-x', graceUntil: null, graceReason: '' };
+        await seedMember({ balance: late });
+        await denied(manual());
+        await seedMember({ balance: { ...late, graceUntil: new Date(Date.now() + D), graceReason: 'وعد' } });
+        await ok(manual());
+      });
+      it('a limited plan counts each visit and stops at the limit; the counter moves by one only', async () => {
+        await seedMember({ membership: summary({ unit: 'session', visitQuota: 1, visitsUsed: 0, endsAt: new Date(Date.now() + 10 * H1) }) });
+        const ops = checkIn({ actorUid: 'cash1', checkinId: nextId('ci-'), member: await em(), method: 'MANUAL', code: null, counts: true }) as Op[];
+        (ops[1] as { data: Record<string, unknown> }).data['membership.visitsUsed'] = 0;
+        await denied(h.as(CASHIER).commit(ops));
+        await ok(h.as(CASHIER).commit(checkIn({ actorUid: 'cash1', checkinId: nextId('ci-'), member: await em(), method: 'MANUAL', code: null, counts: true }) as Op[]));
+        expect(((await h.peek('members/mem2'))?.membership as { visitsUsed: number }).visitsUsed).toBe(1);
+        await h.seed({ 'members/mem2': { ...((await h.peek('members/mem2')) as Record<string, unknown>), lastCheckInAt: new Date(Date.now() - H1) } });
+        await denied(h.as(CASHIER).commit(checkIn({ actorUid: 'cash1', checkinId: nextId('ci-'), member: await em(), method: 'MANUAL', code: null, counts: true }) as Op[]));
+      });
+      it('not twice within two minutes; coaches and members cannot check anyone in', async () => {
+        await seedMember({ lastCheckInAt: new Date(Date.now() - 30_000) });
+        await denied(h.as(CASHIER).commit(checkIn({ actorUid: 'cash1', checkinId: nextId('ci-'), member: await em(), method: 'MANUAL', code: null, counts: false }) as Op[]));
+        await seedMember();
+        await denied(h.as(COACH).commit(checkIn({ actorUid: 'coach1', checkinId: nextId('ci-'), member: await em(), method: 'MANUAL', code: null, counts: false }) as Op[]));
+        await denied(h.as(MEMBER2).commit(checkIn({ actorUid: 'u-mem2', checkinId: nextId('ci-'), member: await em(), method: 'MANUAL', code: null, counts: false }) as Op[]));
+      });
+    });
+
+    describe('Phase 4: VIP', () => {
+      it('an admin sets tier perks and a member\'s tier; a cashier cannot', async () => {
+        await ok(h.as(ADMIN).commit(setVipTier({ actorUid: 'admin1', auditId: nextId('vt-'), tier: 'ELITE', doc: { nameAr: 'إيليت', nameEn: 'Elite', perksAr: 'قياسات مجانية', perksEn: 'Free assessments' } })));
+        await ok(h.as(ADMIN).commit(setMemberVip({ actorUid: 'admin1', auditId: nextId('mv-'), memberId: 'mem1', tier: 'ELITE' })));
+        expect((await h.peek('members/mem1'))?.vipTierId).toBe('ELITE');
+        await denied(h.as(CASHIER).commit(setMemberVip({ actorUid: 'cash1', auditId: nextId('mv-'), memberId: 'mem2', tier: 'PLUS' })));
+        const bad = setMemberVip({ actorUid: 'admin1', auditId: nextId('mv-'), memberId: 'mem2', tier: 'PLUS' });
+        (bad[0].data as Record<string, unknown>).vipTierId = 'GOLD';
+        await denied(h.as(ADMIN).commit(bad));
+      });
+    });
+
+    describe('Phase 3: banners (admin) shown to members', () => {
+      const banner: BannerDoc = { title: 'عرض الشهر', body: 'خصم 10%', tag: 'عرض', tone: 'primary', figure: 'flex', status: 'PUBLISHED', vipOnly: false, sort: 0, endsAt: null };
+      it('an admin publishes a banner; a cashier cannot; members read only published ones', async () => {
+        await ok(h.as(ADMIN).commit(setBanner({ actorUid: 'admin1', auditId: nextId('bn-'), bannerId: 'b1', banner })));
+        await ok(h.as(ADMIN).commit(setBanner({ actorUid: 'admin1', auditId: nextId('bn-'), bannerId: 'b2', banner: { ...banner, status: 'DRAFT' } })));
+        await denied(h.as(CASHIER).commit(setBanner({ actorUid: 'cash1', auditId: nextId('bn-'), bannerId: 'b3', banner })));
+        await ok(h.as(MEMBER1).get('banners/b1'));
+        await denied(h.as(MEMBER1).get('banners/b2'));
+      });
+      it('a banner cannot carry an outside picture or a long text', async () => {
+        const ops = setBanner({ actorUid: 'admin1', auditId: 'bn-x', bannerId: 'b4', banner });
+        (ops[0].data as Record<string, unknown>).figure = 'https://evil.example/x.png';
+        await denied(h.as(ADMIN).commit(ops));
+      });
+    });
+
+    describe('Phase 3: plans and settings (admin)', () => {
+      it('an admin saves a plan and the settings; a cashier cannot', async () => {
+        const plan: PlanDoc = { ...PLAN_M1, code: 'M3', nameAr: '3 شهور', nameEn: '3 months', value: 3, price: 270000 };
+        await ok(h.as(ADMIN).commit(setPlan({ actorUid: 'admin1', auditId: nextId('pl-'), planId: 'p_m3', plan })));
+        await denied(h.as(CASHIER).commit(setPlan({ actorUid: 'cash1', auditId: nextId('pl-'), planId: 'p_m3', plan: { ...plan, price: 100 } })));
+        await ok(h.as(ADMIN).commit(setGymSettings({ actorUid: 'admin1', auditId: nextId('gs-'), settings: { ...DEFAULT_GYM_SETTINGS, cashierMaxDiscount: 20 } })));
+        await denied(h.as(CASHIER).commit(setGymSettings({ actorUid: 'cash1', auditId: nextId('gs-'), settings: { ...DEFAULT_GYM_SETTINGS, cashierMaxDiscount: 100 } })));
+      });
+      it('a custom-length plan cannot carry a fixed price', async () => {
+        const ops = setPlan({ actorUid: 'admin1', auditId: 'pl-x', planId: 'p_custom', plan: PLAN_CUSTOM });
+        (ops[0].data as Record<string, unknown>).price = 5000;
+        await denied(h.as(ADMIN).commit(ops));
+      });
+    });
+
+    describe('Phase 3: selling memberships', () => {
+      const base = (over: Partial<SaleInput> = {}): SaleInput => ({
+        actorUid: 'cash1',
+        actorIsAdmin: false,
+        auditId: nextId('ms-a-'),
+        membershipId: nextId('ms-'),
+        paymentId: nextId('pay-'),
+        receiptNo: newReceiptNo(new Date()),
+        member: { id: 'mem2', membership: null, balance: null },
+        planId: 'p_m1',
+        plan: PLAN_M1,
+        customDays: null,
+        customPrice: null,
+        startDate: cairoToday(),
+        discountPct: 0,
+        mode: 'FULL',
+        deposit: 0,
+        balanceDueDate: null,
+        method: 'CASH',
+        reference: null,
+        settings: DEFAULT_GYM_SETTINGS,
+        now: new Date(),
+        ...over,
+      });
+      const sell = (who: AuthSpec, over: Partial<SaleInput> = {}) => h.as(who).commit(sellMembership(base(over)).ops as Op[]);
+      const tamper = (over: Partial<SaleInput>, f: (ops: Op[]) => void) => {
+        const ops = sellMembership(base(over)).ops as Op[];
+        f(ops);
+        return ops;
+      };
+
+      it('a cashier sells a month, paid in full: membership, receipt and member file move together', async () => {
+        const i = base();
+        await ok(h.as(CASHIER).commit(sellMembership(i).ops as Op[]));
+        const m = await h.peek('members/mem2');
+        expect((m?.membership as { id: string }).id).toBe(i.membershipId);
+        expect(m?.balance).toBeNull();
+        expect((await h.peek(`payments/${i.paymentId}`))?.amount).toBe(100000);
+      });
+      it('the price, the discount and the receipt cannot be changed by the browser', async () => {
+        await denied(h.as(CASHIER).commit(tamper({}, (ops) => ((ops[0] as { data: Record<string, unknown> }).data.base = 1000))));
+        await denied(h.as(CASHIER).commit(tamper({}, (ops) => ((ops[1] as { data: Record<string, unknown> }).data.amount = 5000))));
+        // A builder that skipped the cashier limit (as a modified browser would):
+        await denied(sell(CASHIER, { discountPct: 50, actorIsAdmin: true }));
+        // "New member" vs "renewal" is decided from the member file, not by the browser:
+        await denied(h.as(CASHIER).commit(tamper({}, (ops) => ((ops[0] as { data: Record<string, unknown> }).data.renewal = true))));
+        // A sale without its receipt (cash that would never show in the day's totals):
+        await denied(h.as(CASHIER).commit(tamper({}, (ops) => ops.splice(1, 1))));
+        await ok(sell(CASHIER, { discountPct: 10 }));
+      });
+      it('an admin may give any discount', async () => {
+        await ok(sell(ADMIN, { actorUid: 'admin1', actorIsAdmin: true, discountPct: 50 }));
+      });
+      it('a deposit must reach the minimum and leaves a balance on the member file', async () => {
+        await denied(h.as(CASHIER).commit(tamper({ mode: 'DEPOSIT', deposit: 60000, balanceDueDate: cairoToday(7) }, (ops) => {
+          const d = (ops[0] as { data: Record<string, unknown> }).data;
+          d.paidNow = 20000;
+          (ops[1] as { data: Record<string, unknown> }).data.amount = 20000;
+          ((ops[2] as { data: Record<string, unknown> }).data.balance as Record<string, unknown>).remaining = 80000;
+        })));
+        const i = base({ mode: 'DEPOSIT', deposit: 50000, balanceDueDate: cairoToday(7) });
+        await ok(h.as(CASHIER).commit(sellMembership(i).ops as Op[]));
+        expect(((await h.peek('members/mem2'))?.balance as { remaining: number }).remaining).toBe(50000);
+      });
+      it('no deposit on a day pass; no due date beyond the limit', async () => {
+        await denied(h.as(CASHIER).commit(tamper({ planId: 'p_day', plan: PLAN_DAY }, (ops) => {
+          const d = (ops[0] as { data: Record<string, unknown> }).data;
+          d.mode = 'DEPOSIT';
+          d.paidNow = 6000;
+          d.balanceDueAt = new Date(Date.now() + 5 * 86_400_000);
+          (ops[1] as { data: Record<string, unknown> }).data.amount = 6000;
+        })));
+        await denied(h.as(CASHIER).commit(tamper({ mode: 'DEPOSIT', deposit: 50000, balanceDueDate: cairoToday(7) }, (ops) => {
+          const far = new Date(Date.now() + 90 * 86_400_000);
+          (ops[0] as { data: Record<string, unknown> }).data.balanceDueAt = far;
+          ((ops[2] as { data: Record<string, unknown> }).data.balance as Record<string, unknown>).dueAt = far;
+        })));
+      });
+      it('no back-dating and no stretched periods', async () => {
+        // Forged consistently on the membership and the member file, as a modified browser would.
+        const forge = (ops: Op[], startsAt: Date, endsAt: Date) => {
+          const d = (ops[0] as { data: Record<string, unknown> }).data;
+          d.startsAt = startsAt;
+          d.endsAt = endsAt;
+          const sum = (ops[2] as { data: Record<string, unknown> }).data.membership as Record<string, unknown>;
+          sum.startsAt = startsAt;
+          sum.endsAt = endsAt;
+        };
+        const back = DateTime.now().setZone('Africa/Cairo').startOf('day').minus({ days: 20 });
+        await denied(h.as(CASHIER).commit(tamper({}, (ops) => forge(ops, back.toJSDate(), back.plus({ months: 1 }).toJSDate()))));
+        await denied(h.as(CASHIER).commit(tamper({}, (ops) => {
+          const d = (ops[0] as { data: Record<string, unknown> }).data;
+          forge(ops, d.startsAt as Date, new Date((d.endsAt as Date).getTime() + 10 * 86_400_000));
+        })));
+      });
+      it('an early renewal starts when the running period ends, and an unpaid balance is carried', async () => {
+        const now = Date.now();
+        const running: MembershipSummary = { id: 'old-ms', planNameAr: 'شهر', planNameEn: '1 month', unit: 'month', startsAt: new Date(now - 20 * 86_400_000), endsAt: new Date(now + 10 * 86_400_000), status: 'ACTIVE', visitQuota: null, visitsUsed: 0, prev: null };
+        const bal: BalanceDoc = { remaining: 30000, total: 60000, dueAt: new Date(now + 3 * 86_400_000), membershipId: 'old-ms', graceUntil: null, graceReason: '' };
+        await h.seed({ 'members/mem2': { ...member('mem2', 10002, 'سارة محمود', PHONE_MEM2, null, null), membership: running, balance: bal, lastPaymentId: null } });
+        // Starting today, on top of the running month, is refused.
+        await denied(h.as(CASHIER).commit(tamper({ member: { id: 'mem2', membership: running, balance: bal } }, (ops) => {
+          const d = (ops[0] as { data: Record<string, unknown> }).data;
+          const today = DateTime.now().setZone('Africa/Cairo').startOf('day');
+          d.startsAt = today.toJSDate();
+          d.endsAt = today.plus({ months: 1 }).toJSDate();
+          const sum = (ops[2] as { data: Record<string, unknown> }).data.membership as Record<string, unknown>;
+          sum.startsAt = d.startsAt;
+          sum.endsAt = d.endsAt;
+        })));
+        // Dropping the carried balance is refused.
+        await denied(h.as(CASHIER).commit(tamper({ member: { id: 'mem2', membership: running, balance: null } }, () => undefined)));
+        const i = base({ member: { id: 'mem2', membership: running, balance: bal } });
+        const r = sellMembership(i);
+        expect(r.startsAt.getTime()).toBe(running.endsAt.getTime());
+        expect(r.quote.due).toBe(130000);
+        await ok(h.as(CASHIER).commit(r.ops as Op[]));
+        const m = await h.peek('members/mem2');
+        expect((m?.membership as { prev: unknown }).prev).toBeTruthy();
+      });
+      it('a coach, an accountant or a cashier without a licence cannot sell', async () => {
+        await denied(sell(COACH, { actorUid: 'coach1' }));
+        await h.seed({ 'license/main': { type: 'TRIAL', state: 'SUSPENDED', startsAt: new Date(Date.now() - D), endsAt: null, version: 2, note: '', updatedAt: new Date(), updatedBy: 'dev', lastAuditId: 'seed-l2' } });
+        await denied(sell(CASHIER));
+      });
+    });
+
+    describe('Phase 3: balances, entry permission and refunds', () => {
+      const setup = async () => {
+        const msId = nextId('ms-');
+        const i: SaleInput = {
+          actorUid: 'cash1', actorIsAdmin: false, auditId: nextId('ms-a-'), membershipId: msId, paymentId: nextId('pay-'), receiptNo: newReceiptNo(new Date()),
+          member: { id: 'mem2', membership: null, balance: null }, planId: 'p_m1', plan: PLAN_M1, customDays: null, customPrice: null, startDate: cairoToday(),
+          discountPct: 0, mode: 'DEPOSIT', deposit: 60000, balanceDueDate: cairoToday(5), method: 'CASH', reference: null, settings: DEFAULT_GYM_SETTINGS, now: new Date(),
+        };
+        const r = sellMembership(i);
+        await h.as(CASHIER).commit(r.ops as Op[]);
+        const m = (await h.peek('members/mem2')) as Record<string, unknown>;
+        const toDate = (v: unknown) => (v instanceof Date ? v : (v as { toDate(): Date }).toDate());
+        const b = m.balance as Record<string, unknown>;
+        const balance: BalanceDoc = { remaining: b.remaining as number, total: b.total as number, dueAt: toDate(b.dueAt), membershipId: b.membershipId as string, graceUntil: null, graceReason: '' };
+        const s = m.membership as Record<string, unknown>;
+        const summary: MembershipSummary = { id: s.id as string, planNameAr: s.planNameAr as string, planNameEn: s.planNameEn as string, unit: 'month', startsAt: toDate(s.startsAt), endsAt: toDate(s.endsAt), status: 'ACTIVE', visitQuota: null, visitsUsed: 0, prev: null };
+        return { msId, balance, summary, startsAt: r.startsAt, endsAt: r.endsAt };
+      };
+
+      it('the remainder is paid in parts, never more than what is owed', async () => {
+        const { balance } = await setup();
+        const pay = (amount: number) => payBalance({ actorUid: 'cash1', auditId: nextId('bp-'), paymentId: nextId('pay-'), receiptNo: newReceiptNo(new Date()), memberId: 'mem2', balance, amount, method: 'CASH', reference: null });
+        const over = pay(10000) as Op[];
+        (over[0] as { data: Record<string, unknown> }).data.amount = 90000;
+        ((over[1] as { data: Record<string, unknown> }).data.balance as Record<string, unknown>).remaining = balance.remaining - 90000;
+        await denied(h.as(CASHIER).commit(over));
+        await ok(h.as(CASHIER).commit(pay(10000) as Op[]));
+        expect(((await h.peek('members/mem2'))?.balance as { remaining: number }).remaining).toBe(30000);
+        const rest = payBalance({ actorUid: 'cash1', auditId: nextId('bp-'), paymentId: nextId('pay-'), receiptNo: newReceiptNo(new Date()), memberId: 'mem2', balance: { ...balance, remaining: 30000 }, amount: 30000, method: 'INSTAPAY', reference: '8842' });
+        await ok(h.as(CASHIER).commit(rest as Op[]));
+        expect((await h.peek('members/mem2'))?.balance).toBeNull();
+      });
+      it('a member lists their own receipts, not anyone else\'s', async () => {
+        await setup();
+        await h.seed({ 'users/u-mem2': { kind: 'member', roles: ['member'], status: 'active', displayName: 'سارة', phone: PHONE_MEM2, memberId: 'mem2', inviteId: 'seed', createdAt: new Date() } });
+        const MEMBER2 = { uid: 'u-mem2', email: email(2) };
+        const mine = await h.as(MEMBER2).list('payments', 'memberId', 'mem2');
+        expect(mine.length).toBeGreaterThan(0);
+        await denied(h.as(MEMBER1).list('payments', 'memberId', 'mem2'));
+      });
+      it('only an admin lets a late member in, for a limited time, with a reason', async () => {
+        const { balance } = await setup();
+        const g = (who: string, until: string) => grantEntry({ actorUid: who, auditId: nextId('gr-'), memberId: 'mem2', balance, untilDate: until, reason: 'وعد بالسداد', now: new Date() });
+        await denied(h.as(CASHIER).commit(g('cash1', cairoToday(3))));
+        await ok(h.as(ADMIN).commit(g('admin1', cairoToday(3))));
+        const far = g('admin1', cairoToday(3));
+        ((far[0].data.balance as Record<string, unknown>).graceUntil as unknown) = new Date(Date.now() + 60 * 86_400_000);
+        await denied(h.as(ADMIN).commit(far));
+      });
+      it('an admin cancels with a refund up to what was paid; a cashier cannot cancel', async () => {
+        const { msId, balance, summary, startsAt, endsAt } = await setup();
+        const c = (who: string, refund: number) =>
+          cancelMembership({
+            actorUid: who, auditId: nextId('cx-'), membershipId: msId,
+            membership: { memberId: 'mem2', due: 100000, status: 'ACTIVE', startsAt, endsAt, plan: { price: 100000, nameAr: 'شهر', nameEn: '1 month' } },
+            member: { id: 'mem2', membership: summary, balance }, refund, overridden: false, reason: 'سفر', paymentId: nextId('pay-'), receiptNo: newReceiptNo(new Date()), method: 'CASH',
+          }) as Op[];
+        await denied(h.as(CASHIER).commit(c('cash1', 10000)));
+        const tooMuch = c('admin1', 60000);
+        ((tooMuch[0] as { data: Record<string, unknown> }).data.cancel as Record<string, unknown>).refund = 90000;
+        (tooMuch[3] as { data: Record<string, unknown> }).data.amount = 90000;
+        await denied(h.as(ADMIN).commit(tooMuch));
+        await ok(h.as(ADMIN).commit(c('admin1', 60000)));
+        const m = await h.peek('members/mem2');
+        expect((m?.membership as { status: string }).status).toBe('CANCELLED');
+        expect(m?.balance).toBeNull();
+      });
+      it('receipts cannot be written alone, edited or deleted', async () => {
+        await denied(h.as(CASHIER).commit([{ type: 'set', path: 'payments/fake', data: { memberId: 'mem2', membershipId: null, kind: 'BALANCE', amount: 100, method: 'CASH', reference: null, receiptNo: 'R-261015-ABCDE', by: 'cash1', at: SERVER_TIME } }]));
+        const { msId } = await setup();
+        const ms = (await h.peek(`memberships/${msId}`)) as Record<string, unknown>;
+        await denied(h.as(ADMIN).commit([{ type: 'update', path: `payments/${ms.paymentId as string}`, data: { amount: 1 } }]));
+        await denied(h.as(ADMIN).commit([{ type: 'delete', path: `payments/${ms.paymentId as string}` }]));
+        await denied(h.as(ADMIN).commit([{ type: 'update', path: `memberships/${msId}`, data: { due: 1 } }]));
+      });
+    });
+
+    describe('wiping member data (developer, fresh code + phrase)', () => {
+      const memberDeletes = () =>
+        wipeDeletes({
+          members: [
+            { id: 'mem1', phoneE164: PHONE_MEM1 },
+            { id: 'mem2', phoneE164: PHONE_MEM2 },
+          ],
+          memberUserUids: ['u-mem1'],
+          memberInviteIds: [],
+        });
+      it('the developer wipes members, their sign-ins and the counter; staff stay', async () => {
+        await ok(h.as(DEV).commit(wipeRecord({ actorUid: 'dev', auditId: 'w-a1', wipeId: 'w1', counts: { members: 3, accounts: 2, invites: 0 } })));
+        const ops = memberDeletes();
+        for (let i = 0; i < ops.length; i += 8) await ok(h.as(DEV).commit(ops.slice(i, i + 8)));
+        expect(await h.peek('members/mem1')).toBeUndefined();
+        expect(await h.peek('users/u-mem1')).toBeUndefined();
+        expect(await h.peek('loginAliases/m+201011111111')).toBeUndefined();
+        expect(await h.peek('counters/members')).toBeUndefined();
+        expect(await h.peek('users/cash1')).toBeTruthy();
+        expect(await h.peek('loginAliases/s+201511111111')).toBeTruthy();
+      });
+      it('staff profiles and staff aliases can never be wiped', async () => {
+        await denied(h.as(DEV).commit([{ type: 'delete', path: 'users/cash1' }]));
+        await denied(h.as(DEV).commit([{ type: 'delete', path: 'loginAliases/s+201511111111' }]));
+        await denied(h.as(DEV).commit([{ type: 'delete', path: 'auditLogs/seed-a' }]));
+      });
+      it('an admin, a cashier, or a developer without a recent check cannot wipe', async () => {
+        for (const who of [ADMIN, CASHIER]) {
+          await denied(h.as(who).commit([{ type: 'delete', path: 'members/mem2' }]));
+          await denied(h.as(who).commit(wipeRecord({ actorUid: who.uid, auditId: 'w-x' + who.uid, wipeId: 'wx' + who.uid, counts: { members: 1, accounts: 0, invites: 0 } })));
+        }
+        await denied(h.as(DEV_NO_MFA).commit([{ type: 'delete', path: 'members/mem2' }]));
+        await h.seed({ 'staffSessions/dev': { authTime: SIGNED_IN_AT, device: 'test', at: new Date(Date.now() - 3600_000) } });
+        await denied(h.as(DEV).commit([{ type: 'delete', path: 'members/mem2' }]));
+      });
+    });
+
+    describe('one person, several jobs', () => {
+      it('an admin adds a job to an existing cashier account; never to an admin account', async () => {
+        const target = { uid: 'cash1', kind: 'staff' as const, roles: ['cashier'], status: 'active' as const };
+        await ok(h.as(ADMIN).commit(updateStaff({ actorUid: 'admin1', actorRoles: ['admin'], auditId: 'mj-1', target, roles: ['cashier', 'coach'] })));
+        expect((await h.peek('users/cash1'))?.roles).toEqual(['cashier', 'coach']);
+        await denied(h.as(ADMIN).commit([
+          { type: 'update', path: 'users/admin2', data: { roles: ['admin', 'coach'], updatedAt: SERVER_TIME, lastAuditId: 'mj-2' } },
+          { type: 'set', path: 'auditLogs/mj-2', data: { actorUid: 'admin1', action: 'staff.update', entityType: 'users', entityId: 'admin2', at: SERVER_TIME, summary: {} } },
+        ]));
+      });
+    });
+
     describe('audit log cannot be forged or edited', () => {
       it('standalone entries, edits and deletes are refused', async () => {
         await denied(h.as(CASHIER).commit([{ type: 'set', path: 'auditLogs/fake', data: { actorUid: 'cash1', action: 'member.register', entityType: 'members', entityId: 'mem1', at: SERVER_TIME, summary: {} } }]));
@@ -543,7 +1020,7 @@ export function defineScenarios(name: string, h: Harness) {
 
     describe('later-phase collections stay closed to browsers', () => {
       it('no one writes memberships, payments or check-ins yet', async () => {
-        for (const p of ['memberships/x', 'payments/x', 'checkins/x', 'financeEntries/x', 'plans/x']) {
+        for (const p of ['memberships/x', 'payments/x', 'checkins/x', 'financeEntries/x', 'plans/x', 'gymSettings/main']) {
           await denied(h.as(ADMIN).commit([{ type: 'set', path: p, data: { a: 1 } }]));
         }
       });

@@ -115,7 +115,8 @@ export function Shell({ children, nav, bottomNav, defaultTheme, showCloud, width
   const name = lang === 'ar' ? gym.nameAr : gym.nameEn;
   const session = useSession();
   const navigate = useNavigate();
-  const sample = !demoMode && !livePaths.some((p) => pathname === p || pathname.startsWith(p + '/'));
+  // A path ending in $ matches exactly (an area's index page without its sub-pages).
+  const sample = !demoMode && !livePaths.some((p) => (p.endsWith('$') ? pathname === p.slice(0, -1) : pathname === p || pathname.startsWith(p + '/')));
 
   const navList = nav && (
     <nav className="stack-sm" style={{ gap: 2 }} aria-label={title ?? name}>

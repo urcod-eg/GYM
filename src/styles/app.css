@@ -1433,6 +1433,94 @@ table.table {
   color: var(--text-muted);
 }
 
+/* ---------- live camera ---------- */
+.scan-frame.live {
+  overflow: hidden;
+  padding: 0;
+}
+.scan-frame.live video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.qr-live {
+  background: #fff;
+  padding: 14px;
+  border-radius: 18px;
+  width: min(78vw, 300px);
+  margin-inline: auto;
+}
+.qr-live svg {
+  display: block;
+  width: 100%;
+  height: auto;
+}
+
+/* ---------- banner picture picker ---------- */
+.figure-pick {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+.figure-pick button {
+  aspect-ratio: 1;
+  border-radius: 12px;
+  border: 2px solid var(--border);
+  background: #15161b;
+  overflow: hidden;
+  padding: 0;
+  cursor: pointer;
+}
+.figure-pick button[aria-pressed='true'] {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px var(--primary-soft);
+}
+.figure-pick img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  object-position: bottom;
+  filter: grayscale(1);
+}
+.figure-pick button[aria-pressed='true'] img {
+  filter: none;
+}
+@media (max-width: 420px) {
+  .figure-pick {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+/* ---------- security page ---------- */
+.sec-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: var(--space-3);
+}
+.sec-stat {
+  display: grid;
+  gap: 2px;
+  padding: 14px 16px;
+}
+.sec-stat svg {
+  width: 22px;
+  height: 22px;
+}
+.sec-stat strong {
+  font-size: 1.75rem;
+  line-height: 1.1;
+}
+.sec-stat.tone-success svg {
+  color: var(--success);
+}
+.sec-stat.tone-danger svg {
+  color: var(--danger);
+}
+.sec-stat.tone-warning svg {
+  color: var(--warning);
+}
+
 /* ---------- athlete photography ---------- */
 .hero-body {
   position: relative;

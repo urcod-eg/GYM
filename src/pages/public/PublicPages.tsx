@@ -60,6 +60,7 @@ export function LoginPage() {
   const [phone, setPhone] = useState('');
   const [pw, setPw] = useState('');
   const [show, setShow] = useState(false);
+  const [remember, setRememberChoice] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [installOpen, setInstallOpen] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
@@ -67,6 +68,11 @@ export function LoginPage() {
   const { canPrompt, installed } = useInstallState();
   const gym = useGym();
   const session = useSession();
+
+  // A remembered member opens straight into their app (staff keep the notice: they may switch accounts).
+  useEffect(() => {
+    if (!demoMode && session.profile?.kind === 'member' && session.roles.includes('member')) navigate('/member', { replace: true });
+  }, [session.profile?.kind, session.roles, navigate]);
 
   const install = async () => {
     const result = await promptInstall();
@@ -85,6 +91,8 @@ export function LoginPage() {
     if (demoMode) return toast(t('login.needServer'));
     setBusy(true);
     try {
+      // Remember me: the sign-in stays on THIS device only (another phone still needs the password).
+      await setRemember(remember);
       // Phone → internal sign-in address (loginAliases), then Firebase Auth checks the password.
       await phoneSignIn('member', phone, pw);
       navigate('/member', { replace: true });
@@ -118,6 +126,13 @@ export function LoginPage() {
             </button>
           </div>
         </div>
+        <label className="check-row" htmlFor="m-remember">
+          <input id="m-remember" type="checkbox" checked={remember} onChange={(e) => setRememberChoice(e.target.checked)} />
+          <span className="stack-sm" style={{ gap: 2 }}>
+            <span>{t('login.remember')}</span>
+            <span className="hint">{t('login.rememberHint')}</span>
+          </span>
+        </label>
         <button className="btn btn-primary btn-lg btn-block" type="submit" disabled={busy} aria-busy={busy}>{t('login.submit')}</button>
         <button type="button" className="linkish" onClick={() => setSupportOpen(true)}>{t('login.forgot')}</button>
         <div className="divider" />

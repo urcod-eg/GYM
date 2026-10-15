@@ -148,7 +148,7 @@ export class SimClient {
       } else {
         if (!existing) throw new Error(`NOT_FOUND: update ${op.path}`);
         methods.push('update');
-        after.set(op.path, { ...existing, ...(resolve(op.data, now) as Data) });
+        after.set(op.path, mergeUpdate(existing, resolve(op.data, now) as Data));
       }
     }
     const lookups = new Set<string>();
@@ -162,3 +162,24 @@ export class SimClient {
 }
 
 export { toRV };
+
+/** Firestore update semantics: top-level keys replace; "a.b" paths set a nested field. */
+function mergeUpdate(existing: Data, patch: Data): Data {
+  const out: Data = { ...existing };
+  for (const [k, v] of Object.entries(patch)) {
+    if (!k.includes('.')) {
+      out[k] = v;
+      continue;
+    }
+    const parts = k.split('.');
+    let cur = out as Record<string, unknown>;
+    for (let i = 0; i < parts.length - 1; i++) {
+      const next = cur[parts[i]];
+      const copy = next && typeof next === 'object' && !(next instanceof Date) ? { ...(next as Record<string, unknown>) } : {};
+      cur[parts[i]] = copy;
+      cur = copy;
+    }
+    cur[parts[parts.length - 1]] = v;
+  }
+  return out;
+}

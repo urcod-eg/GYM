@@ -1,11 +1,11 @@
 import { useMemo, useState } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
-import { useApp, useServerAction } from '../../app/AppContext';
-import { Icon } from '../../components/Icon';
+import { useApp } from '../../app/AppContext';
 import { Shell, type NavItem } from '../../components/Shell';
-import { Avatar, PlaceholderPage, StatusBadge, VipBadge } from '../../components/ui';
-import { DEMO_WORKOUT } from '../../mock/demo';
+import { Avatar, StatusBadge, VipBadge } from '../../components/ui';
 import { memberRows } from './shared';
+import { demoMode } from '../../firebase/client';
+import { LibraryPage, LiveTrainees, TraineePanel } from './Coaching';
 
 const ME = 'c1'; // demo: signed in as كابتن محمد سامي
 
@@ -16,10 +16,10 @@ export function CoachArea() {
     { to: '/coach/library', label: t('coach.library'), icon: 'dumbbell' },
   ];
   return (
-    <Shell nav={nav} defaultTheme="light" title={t('role.coach')}>
+    <Shell nav={nav} defaultTheme="light" title={t('role.coach')} livePaths={['/coach']}>
       <Routes>
-        <Route index element={<Trainees />} />
-        <Route path="library" element={<PlaceholderPage title={t('coach.library')} phase={5} />} />
+        <Route index element={demoMode ? <Trainees /> : <LiveTrainees />} />
+        <Route path="library" element={<LibraryPage />} />
         <Route path="*" element={<Navigate to="/coach" replace />} />
       </Routes>
     </Shell>
@@ -27,8 +27,7 @@ export function CoachArea() {
 }
 
 function Trainees() {
-  const { t, lang, fmtDate } = useApp();
-  const server = useServerAction();
+  const { t } = useApp();
   // A coach only ever receives their own trainees (enforced by rules in Phase 5).
   const mine = useMemo(() => memberRows().filter((r) => r.m.coachId === ME), []);
   const [sel, setSel] = useState(mine[0]?.m.id);
@@ -57,44 +56,7 @@ function Trainees() {
           ))}
         </div>
       </section>
-      {r && (
-        <section className="card stack">
-          <div className="row">
-            <Avatar name={r.m.name} size="lg" />
-            <div className="grow">
-              <strong style={{ fontSize: '1.25rem' }}>{r.m.name}</strong>
-              <div className="muted small">
-                {lang === 'ar' ? r.planAr : r.planEn} · {t('cashier.ends')} {fmtDate(r.lastDay, 'short')}
-              </div>
-            </div>
-          </div>
-          <h2 className="card-title">
-            {t('coach.plan')}: {lang === 'ar' ? DEMO_WORKOUT.titleAr : DEMO_WORKOUT.titleEn}
-          </h2>
-          <div>
-            {DEMO_WORKOUT.exercises.map((e) => (
-              <div key={e.nameEn} className="exercise" style={{ gridTemplateColumns: '1fr auto' }}>
-                <div>
-                  <div className="bold">{lang === 'ar' ? e.nameAr : e.nameEn}</div>
-                  <div className="muted small num">
-                    {e.sets} × {e.reps} · {e.rest}s
-                  </div>
-                </div>
-                <span className="badge badge-neutral no-dot ltr">{e.target}</span>
-              </div>
-            ))}
-          </div>
-          <div className="row">
-            <button className="btn btn-secondary grow" onClick={server}>
-              <Icon name="dumbbell" />
-              {t('coach.edit')}
-            </button>
-            <button className="btn btn-primary grow" onClick={server}>
-              {t('coach.publish')}
-            </button>
-          </div>
-        </section>
-      )}
+      {r && <TraineePanel r={r} coachId={ME} />}
     </div>
   );
 }

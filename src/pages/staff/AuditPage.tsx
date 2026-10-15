@@ -22,7 +22,10 @@ const DEMO: AuditRow[] = [
 ];
 
 /** Last 100 sensitive actions, newest first. Append-only: the rules refuse edits and deletes. */
-export function AuditPage() {
+/** Actions shown on the security page. */
+export const SECURITY_ACTIONS = ['member.block', 'member.unblock', 'staff.update', 'staff.remove', 'staff.pin', 'dev.secret', 'license.set', 'data.wipe', 'membership.cancel', 'balance.grant', 'balance.revoke', 'settings.set'];
+
+export function AuditPage({ only, embedded }: { only?: string[]; embedded?: boolean } = {}) {
   const { t, fmtDate, fmtTime } = useApp();
   const [rows, setRows] = useState<AuditRow[] | null>(demoMode ? DEMO : null);
   const [names, setNames] = useState<Record<string, string>>({});
@@ -51,23 +54,26 @@ export function AuditPage() {
     };
   }, []);
 
+  const list = rows && only ? rows.filter((r) => only.includes(r.action)).slice(0, 20) : rows;
   return (
     <div className="stack">
-      <div className="stack-sm" style={{ gap: 4 }}>
-        <h1 className="page-title">{t('audit.title')}</h1>
-        <p className="muted small">{t('audit.body')}</p>
-      </div>
+      {!embedded && (
+        <div className="stack-sm" style={{ gap: 4 }}>
+          <h1 className="page-title">{t('audit.title')}</h1>
+          <p className="muted small">{t('audit.body')}</p>
+        </div>
+      )}
       {error ? (
         <Notice tone="danger" icon="alert">{t('acc.loadError')}</Notice>
-      ) : rows === null ? (
+      ) : list === null ? (
         <p className="muted" aria-busy="true">…</p>
-      ) : rows.length === 0 ? (
+      ) : list.length === 0 ? (
         <p className="muted">{t('audit.empty')}</p>
       ) : (
         <div className="card" style={{ padding: 0, overflowX: 'auto' }}>
           <table className="table">
             <tbody>
-              {rows.map((r) => {
+              {list.map((r) => {
                 const key = `audit.${r.action}` as StringKey;
                 return (
                   <tr key={r.id}>

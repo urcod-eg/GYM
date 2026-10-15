@@ -27,9 +27,9 @@ createRoot(document.getElementById('root')!).render(
   <StrictMode>
     <AppProvider>
       <GymProvider>
+      <SessionProvider>
       <PlansProvider>
       <LedgerProvider>
-      <SessionProvider>
       <Router>
         {demoMode && <DemoBar />}
         <PwaStatus />
@@ -49,9 +49,9 @@ createRoot(document.getElementById('root')!).render(
         </Routes>
         </Suspense>
       </Router>
-      </SessionProvider>
       </LedgerProvider>
       </PlansProvider>
+      </SessionProvider>
       </GymProvider>
     </AppProvider>
   </StrictMode>,

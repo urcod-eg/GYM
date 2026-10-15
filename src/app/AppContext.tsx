@@ -21,7 +21,7 @@ interface AppState {
   /** Role screens call this; it only applies when the viewer never chose a theme. */
   applyRoleDefault: (t: Theme) => void;
   t: (key: StringKey, vars?: Record<string, string | number>) => string;
-  fmtDate: (dt: DateTime | Date | string, style?: 'short' | 'long') => string;
+  fmtDate: (dt: DateTime | Date | string | null | undefined, style?: 'short' | 'long') => string;
   fmtTime: (dt: DateTime | Date | string) => string;
   fmtNum: (n: number) => string;
   toast: (text: string, tone?: Toast['tone']) => void;
@@ -92,8 +92,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
     typeof v === 'string' ? DateTime.fromISO(v, { zone: GYM_TZ }) : v instanceof Date ? DateTime.fromJSDate(v, { zone: GYM_TZ }) : v.setZone(GYM_TZ);
 
   const fmtDate = useCallback(
-    (v: DateTime | Date | string, style: 'short' | 'long' = 'long') =>
-      toDT(v).setLocale(locale).toLocaleString(style === 'long' ? { day: 'numeric', month: 'long', year: 'numeric' } : { day: 'numeric', month: 'short' }),
+    (v: DateTime | Date | string | null | undefined, style: 'short' | 'long' = 'long') =>
+      v == null ? '—' : toDT(v).setLocale(locale).toLocaleString(style === 'long' ? { day: 'numeric', month: 'long', year: 'numeric' } : { day: 'numeric', month: 'short' }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [locale],
   );

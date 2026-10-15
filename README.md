@@ -1,7 +1,10 @@
 # Gym Management PWA — urcod
 
-Phases 1–2: the app shell and all role screens (Phase 1), plus real sign-in, roles, member and staff
-accounts, blocks, licence, gym identity and the audit log on Firebase's free plan (Phase 2).
+Phases 1–6 on Firebase's free plan: app shell and role screens (1); sign-in, roles, accounts, blocks,
+licence, identity and audit log (2); plans, memberships, full/deposit payments, balances, refunds,
+receipts log and banners (3); rotating-QR check-in enforced by the rules, visit quotas, attendance and
+VIP (4); coaches, workout and nutrition plans, exercise library, member logs (5); income/expenses,
+cash-drawer close, monthly reports and Excel export (6).
 Screens that belong to later phases still run on sample data and say so.
 
 ## Run

@@ -6,16 +6,24 @@ import { Icon } from '../../components/Icon';
 import { Shell, type NavItem } from '../../components/Shell';
 import { Avatar, BalanceBadge, Modal, Notice, StatusBadge, VipBadge } from '../../components/ui';
 import { useGym } from '../../app/GymContext';
-import { AccountsPage } from './Accounts';
+import { AccountsPage, InviteDialog } from './Accounts';
 import { decideEntry, type DenyReason } from '../../domain/checkin';
-import { GYM_TZ, computeEndExclusive, lastUsableDay, localStartOfDay, renewalStart, todayISO } from '../../domain/dates';
+import { computeEndExclusive, lastUsableDay, localStartOfDay, todayISO, type MembershipPhase } from '../../domain/dates';
 import { CUSTOM_DAYS_MAX, CUSTOM_DAYS_MIN, egp, formatEGP, quote } from '../../domain/plans';
 import { usePlans } from '../../app/PlansContext';
-import { useLedger } from '../../app/LedgerContext';
+import { useLedger, useRows } from '../../app/LedgerContext';
 import { balanceDueDates, balanceStatus, planPayment, type PaymentError, type PayMode } from '../../domain/payments';
 import { formatEgyptPhone, normalizeEgyptPhone } from '../../domain/text';
-import { DEMO_MEMBERS, DEMO_PAYMENTS, planById } from '../../mock/demo';
-import { memberRows, searchRows, type MemberRow } from './shared';
+import { planDocFromPlan, type PayMethod } from '../../domain/sales';
+import { DEMO_MEMBERS, DEMO_PAYMENTS } from '../../mock/demo';
+import { demoMode } from '../../firebase/client';
+import * as data from '../../firebase/data';
+import { useActor } from '../../app/SessionContext';
+import { useErrorText } from '../../app/useErrorText';
+import { memberRows, paidUntil, searchRows, type MemberRow } from './shared';
+import { MethodPicker, PayRemainderModal, ReceiptView, useTodayTotals } from './Money';
+import { LiveScan } from './Attendance';
+import { CashCloseCard } from './Finance';
 
 export function CashierArea() {
   const { t } = useApp();
@@ -25,15 +33,16 @@ export function CashierArea() {
     { to: '/cashier/accounts', label: t('nav.accounts'), icon: 'users' },
     { to: '/cashier/new', label: t('cashier.newMember'), icon: 'plus' },
     { to: '/cashier/scan', label: t('cashier.scan'), icon: 'scan' },
-    { to: '/cashier/pending', label: `${t('cashier.pending')} (${pending})`, icon: 'wallet' },
+    // Transfer proofs uploaded by members need file storage (a paid Firebase feature): preview only.
+    ...(demoMode ? [{ to: '/cashier/pending', label: `${t('cashier.pending')} (${pending})`, icon: 'wallet' as const }] : []),
   ];
   return (
-    <Shell nav={nav} defaultTheme="light" title={t('role.cashier')} livePaths={['/cashier/accounts']}>
+    <Shell nav={nav} defaultTheme="light" title={t('role.cashier')} livePaths={['/cashier$', '/cashier/accounts', '/cashier/new', '/cashier/scan']}>
       <Routes>
         <Route index element={<Reception />} />
         <Route path="accounts" element={<AccountsPage admin={false} />} />
         <Route path="new" element={<QuickRegisterRoute />} />
-        <Route path="scan" element={<ScanPage />} />
+        <Route path="scan" element={demoMode ? <ScanPage /> : <LiveScan />} />
         <Route path="pending" element={<PendingPayments />} />
         <Route path="*" element={<Navigate to="/cashier" replace />} />
       </Routes>
@@ -43,15 +52,16 @@ export function CashierArea() {
 
 /* ---------- reception ---------- */
 function Reception() {
-  const { t, fmtTime } = useApp();
-  const { isCancelled } = useLedger();
+  const { t, lang, fmtNum } = useApp();
+  const { isCancelled, rows: liveRows, rowsError } = useLedger();
+  const actor = useActor();
   const navigate = useNavigate();
   const [q, setQ] = useState('');
-  const rows = useMemo(memberRows, []);
+  const rows = useRows();
   const results = useMemo(() => searchRows(rows, q).slice(0, 25), [rows, q]);
-  const [selId, setSelId] = useState<string | null>('m1');
-  const sel = rows.find((r) => r.m.id === selId) ?? null;
-  const pending = DEMO_PAYMENTS.filter((p) => p.status === 'PROOF_SUBMITTED').length;
+  const [selId, setSelId] = useState<string | null>(demoMode ? 'm1' : null);
+  const sel = rows.find((r) => r.m.id === selId) ?? (q ? results[0] : null) ?? null;
+  const day = useTodayTotals(actor.uid);
 
   return (
     <div className="stack">
@@ -72,17 +82,24 @@ function Reception() {
           <Icon name="scan" />
           {t('cashier.scan')}
         </button>
-        <button className="btn btn-secondary btn-lg" onClick={() => navigate('/cashier/pending')}>
-          <Icon name="wallet" />
-          {t('cashier.pending')} <span className="badge badge-warning no-dot">{pending}</span>
+        <button className="btn btn-secondary btn-lg" onClick={() => navigate('/cashier/accounts')}>
+          <Icon name="users" />
+          {t('nav.accounts')}
         </button>
       </div>
 
+      {rowsError && <Notice tone="danger" icon="alert">{t('acc.loadError')}</Notice>}
       <div className="grid-2" style={{ alignItems: 'start' }}>
         <section className="card" style={{ padding: 8 }} aria-label={t('app.search')}>
-          {results.length === 0 && <p className="muted" style={{ padding: 16 }}>{t('app.noResults')}</p>}
+          {!demoMode && liveRows === null ? (
+            <p className="muted" style={{ padding: 16 }} aria-busy="true">…</p>
+          ) : rows.length === 0 ? (
+            <p className="muted" style={{ padding: 16 }}>{t('acc.empty')}</p>
+          ) : results.length === 0 ? (
+            <p className="muted" style={{ padding: 16 }}>{t('app.noResults')}</p>
+          ) : null}
           {results.map((r) => (
-            <button key={r.m.id} className="list-item" aria-current={r.m.id === selId} onClick={() => setSelId(r.m.id)}>
+            <button key={r.m.id} className="list-item" aria-current={r.m.id === sel?.m.id} onClick={() => setSelId(r.m.id)}>
               <Avatar name={r.m.name} />
               <div className="grow">
                 <div className="row" style={{ gap: 6 }}>
@@ -103,10 +120,24 @@ function Reception() {
         {sel ? <MemberPanel r={sel} /> : <p className="muted">{t('cashier.selectHint')}</p>}
       </div>
 
-      <div className="card card-flat row small">
-        <Icon name="clock" width={20} height={20} />
-        <span>{t('cashier.cashSession', { time: fmtTime(DateTime.now().setZone(GYM_TZ).set({ hour: 9, minute: 0 })) })}</span>
-      </div>
+      <section className="card card-flat stack-sm">
+        <div className="row-between wrap">
+          <strong>{t('sale.todayTitle')}</strong>
+          <span className="small muted">{t('sale.todayCount', { n: fmtNum(day.count) })}</span>
+        </div>
+        <div className="row wrap" style={{ gap: 16 }}>
+          <span>
+            {t('sale.todayMine')}: <strong className="num">{formatEGP(day.mine, lang)}</strong>
+          </span>
+          <span>
+            {t('sale.todayAll')}: <strong className="num">{formatEGP(day.total, lang)}</strong>
+          </span>
+          <span className="muted small">
+            {t('method.CASH')} {formatEGP(day.byMethod.CASH, lang)} · {t('sale.transfers')} {formatEGP(day.byMethod.WALLET + day.byMethod.INSTAPAY + day.byMethod.BANK, lang)}
+          </span>
+        </div>
+        <CashCloseCard mineCash={day.mineCash} />
+      </section>
     </div>
   );
 }
@@ -114,12 +145,12 @@ function Reception() {
 function MemberPanel({ r }: { r: MemberRow }) {
   const { t, lang, fmtDate, fmtTime } = useApp();
   const navigate = useNavigate();
-  const server = useServerAction();
   const { balanceOf, isCancelled } = useLedger();
   const vip = r.m.vip !== 'STANDARD';
   const bal = balanceOf(r.m.id);
   const bs = balanceStatus(DateTime.now(), bal);
   const [wa, setWa] = useState(false);
+  const [paying, setPaying] = useState(false);
   return (
     <section className="card stack" style={vip ? { borderColor: 'var(--vip)' } : undefined}>
       <div className="row">
@@ -134,6 +165,7 @@ function MemberPanel({ r }: { r: MemberRow }) {
         </div>
       </div>
       {r.m.blocked && <Notice tone="danger" icon="shield">{t('cashier.blockedNote')}</Notice>}
+      {r.phase === 'NONE' && <Notice icon="info">{t('sale.noMembership')}</Notice>}
       {bal && (
         <Notice tone={bs === 'ON_TIME' ? 'warning' : 'danger'} icon="wallet">
           <div className="stack-sm" style={{ gap: 2 }}>
@@ -151,7 +183,7 @@ function MemberPanel({ r }: { r: MemberRow }) {
       <dl className="grid-2" style={{ margin: 0 }}>
         <div>
           <dt className="muted small">{t('cashier.plan')}</dt>
-          <dd style={{ margin: 0 }} className="bold">{lang === 'ar' ? r.planAr : r.planEn}</dd>
+          <dd style={{ margin: 0 }} className="bold">{(lang === 'ar' ? r.planAr : r.planEn) || '—'}</dd>
         </div>
         <div>
           <dt className="muted small">{r.phase === 'SCHEDULED' ? t('cashier.starts') : t('cashier.ends')}</dt>
@@ -159,51 +191,58 @@ function MemberPanel({ r }: { r: MemberRow }) {
         </div>
         <div>
           <dt className="muted small">{t('admin.colPhone')}</dt>
-          <dd style={{ margin: 0 }} className="bold ltr" >{formatEgyptPhone(r.m.phone)}</dd>
+          <dd style={{ margin: 0 }} className="bold ltr">{formatEgyptPhone(r.m.phone)}</dd>
         </div>
         <div>
           <dt className="muted small">{t('cashier.lastVisit')}</dt>
-          <dd style={{ margin: 0 }} className="bold">{r.m.lastCheckIn ? `${fmtDate(r.m.lastCheckIn, 'short')} · ${fmtTime(r.m.lastCheckIn)}` : t('cashier.never')}</dd>
+          <dd style={{ margin: 0 }} className="bold">{r.m.lastCheckIn ? `${fmtDate(r.m.lastCheckIn, 'short')} · ${fmtTime(r.m.lastCheckIn)}` : demoMode ? t('cashier.never') : '—'}</dd>
         </div>
       </dl>
+      {r.next && (
+        <Notice icon="calendar">
+          {t('sale.nextPeriod', { plan: lang === 'ar' ? r.next.planAr : r.next.planEn, date: fmtDate(r.next.start) })}
+        </Notice>
+      )}
       <div className="row wrap">
         <button className="btn btn-primary grow" onClick={() => navigate(`/cashier/new?renew=${r.m.id}`)}>
           <Icon name="refresh" />
-          {t('cashier.renew')}
+          {r.phase === 'NONE' ? t('sale.sellFirst') : t('cashier.renew')}
         </button>
-        <button className={`btn grow ${bal ? 'btn-primary-soft' : 'btn-secondary'}`} onClick={server}>
-          <Icon name="wallet" />
-          {bal ? t('dues.collect') : t('cashier.collect')}
-        </button>
+        {bal && (
+          <button className="btn btn-primary-soft grow" onClick={() => setPaying(true)}>
+            <Icon name="wallet" />
+            {t('dues.collect')}
+          </button>
+        )}
       </div>
-      <button className="btn btn-secondary" onClick={() => setWa(true)}>
-        <Icon name="whatsapp" />
-        {t('wa.send')}
-      </button>
-      {wa && <ActivationMessage r={r} onClose={() => setWa(false)} />}
+      {r.phase !== 'NONE' && (
+        <button className="btn btn-secondary" onClick={() => setWa(true)}>
+          <Icon name="whatsapp" />
+          {t('sale.waSend')}
+        </button>
+      )}
+      {wa && <MembershipMessage r={r} onClose={() => setWa(false)} />}
+      {paying && <PayRemainderModal row={r} onClose={() => setPaying(false)} />}
     </section>
   );
 }
 
-/**
- * WhatsApp welcome message for the sample member panel (spec addendum 1.2 §B). Real activation links
- * are created from «حسابات المشتركين»; this screen runs on sample data until Phase 3.
- */
-function ActivationMessage({ r, onClose }: { r: MemberRow; onClose: () => void }) {
-  const { t, fmtDate, toast } = useApp();
+/** WhatsApp message with the membership details (sign-in details are sent from «حسابات المشتركين»). */
+function MembershipMessage({ r, onClose }: { r: MemberRow; onClose: () => void }) {
+  const { t, lang, fmtDate, toast } = useApp();
   const gym = useGym();
-  const url = 'https://pulse-gym.web.app/#/activate?c=…';
-  const appUrl = url.split('/#')[0];
+  const { balanceOf } = useLedger();
+  const bal = balanceOf(r.m.id);
+  const appUrl = window.location.href.split('#')[0];
   const text = [
-    `🏋️ أهلًا بك في *${gym.nameAr}*، كابتن *${r.m.name}*! 💪`,
-    'تم تأكيد اشتراكك بنجاح.',
+    `🏋️ *${gym.nameAr}* — كابتن *${r.m.name}* 💪`,
     `🏷️ رقم العضوية: *${r.m.code}*`,
     `🎫 الباقة: *${r.planAr}*`,
-    `📅 بداية الاشتراك: *${fmtDate(r.start)}*`,
-    `📅 نهاية الاشتراك (آخر يوم متاح): *${fmtDate(r.lastDay)}*`,
+    `📅 من: *${fmtDate(r.start)}*`,
+    `📅 آخر يوم متاح: *${fmtDate(r.lastDay)}*`,
+    ...(r.next ? [`🔁 التجديد: *${r.next.planAr}* يبدأ ${fmtDate(r.next.start)}`] : []),
+    ...(bal ? [`💰 المتبقي عليك: *${formatEGP(bal.remaining, 'ar')}* قبل نهاية يوم ${fmtDate(bal.dueDate)}`] : []),
     `📱 تطبيق الجيم: ${appUrl}`,
-    `🔐 رابط تفعيل حسابك (صالح 24 ساعة ولمرة واحدة): ${url}`,
-    'نتمنى لك رحلة تدريب موفقة! 🔥',
   ].join('\n');
   const waHref = `https://wa.me/${r.m.phone.replace('+', '')}?text=${encodeURIComponent(text)}`;
 
@@ -218,10 +257,9 @@ function ActivationMessage({ r, onClose }: { r: MemberRow; onClose: () => void }
   };
 
   return (
-    <Modal open onClose={onClose} title={t('wa.title')}>
+    <Modal open onClose={onClose} title={t('sale.waTitle')}>
       <div className="stack">
-        <textarea id="wa-text" className="input" readOnly value={text} rows={10} style={{ padding: 12, minHeight: 220, direction: 'rtl', lineHeight: 1.7 }} />
-        <p className="small muted">{t('wa.demoLink')}</p>
+        <textarea id="wa-text" className="input" readOnly value={text} rows={9} style={{ padding: 12, minHeight: 200, direction: lang === 'ar' ? 'rtl' : 'ltr', lineHeight: 1.7 }} />
         <div className="row wrap">
           <a className="btn btn-success grow" href={waHref} target="_blank" rel="noreferrer">
             <Icon name="whatsapp" />
@@ -238,7 +276,6 @@ function ActivationMessage({ r, onClose }: { r: MemberRow; onClose: () => void }
 }
 
 /* ---------- quick registration / renewal ---------- */
-type Method = 'CASH' | 'WALLET' | 'INSTAPAY' | 'BANK';
 
 /** Re-mount the form when switching between "new" and "renew X" so its state starts clean. */
 function QuickRegisterRoute() {
@@ -247,49 +284,70 @@ function QuickRegisterRoute() {
   return <QuickRegister key={renewId ?? 'new'} renewId={renewId} />;
 }
 
+interface Done {
+  row: MemberRow;
+  receiptNo: string;
+  lines: [string, string][];
+  /** A brand-new member: their sign-in details are created next and sent with the same message. */
+  newMember: data.MemberDoc | null;
+  extraText: string;
+}
+
 function QuickRegister({ renewId }: { renewId: string | null }) {
-  const { t, lang, fmtDate } = useApp();
+  const { t, lang, fmtDate, toast } = useApp();
   const server = useServerAction();
   const navigate = useNavigate();
-  const renewing = renewId ? memberRows().find((r) => r.m.id === renewId) : undefined;
+  const actor = useActor();
+  const errText = useErrorText();
+  const rows = useRows();
+  const renewing = renewId ? rows.find((r) => r.m.id === renewId) : undefined;
+  const isAdmin = actor.roles.includes('admin') || actor.roles.includes('developer');
 
   const [name, setName] = useState(renewing?.m.name ?? '');
   const [phone, setPhone] = useState(renewing ? '0' + renewing.m.phone.slice(3) : '');
-  const { activePlans } = usePlans();
-  const [planId, setPlanId] = useState(renewing?.m.planId ?? 'p_m1');
+  const { activePlans, loading: plansLoading } = usePlans();
+  const [planId, setPlanId] = useState(renewing?.m.planId || activePlans.find((p) => p.code === 'M1')?.id || activePlans[0]?.id || '');
   const [customDays, setCustomDays] = useState(30);
   const [customPrice, setCustomPrice] = useState(1000);
-  const defaultStart = renewing ? renewalStart(DateTime.now(), renewing.end).toISODate()! : todayISO();
+  const until = renewing ? paidUntil(renewing) : null;
+  const defaultStart = until && until > DateTime.now() ? until.toISODate()! : todayISO();
   const [start, setStart] = useState(defaultStart);
   const [discount, setDiscount] = useState(0);
-  const [method, setMethod] = useState<Method>('CASH');
+  const [method, setMethod] = useState<PayMethod>('CASH');
+  const [reference, setReference] = useState('');
   const [touched, setTouched] = useState(false);
-  const { settings, balanceOf } = useLedger();
+  const { settings, settingsDoc, balanceOf } = useLedger();
   const dueDates = balanceDueDates(DateTime.now(), settings);
   const [payMode, setPayMode] = useState<PayMode>('FULL');
   const [depositPounds, setDepositPounds] = useState<number | ''>('');
   const [balanceDue, setBalanceDue] = useState(dueDates.defaultDue);
   const [tenderedPounds, setTenderedPounds] = useState<number | ''>('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [done, setDone] = useState<Done | null>(null);
+  const [sendLogin, setSendLogin] = useState(false);
 
   // A paused or deleted plan cannot be sold; fall back to the first plan on sale.
-  const plan = activePlans.find((p) => p.id === planId) ?? activePlans[0] ?? planById('p_m1');
-  const isCustom = plan.duration === null;
+  const plan = activePlans.find((p) => p.id === planId) ?? activePlans[0] ?? null;
+  const isCustom = !!plan && plan.duration === null;
   const e164 = normalizeEgyptPhone(phone);
-  const dupe = !renewing && e164 ? DEMO_MEMBERS.find((m) => m.phone === e164) : undefined;
+  const dupe = !renewing && e164 ? rows.find((r) => r.m.phone === e164) : undefined;
   const customOk = Number.isInteger(customDays) && customDays >= CUSTOM_DAYS_MIN && customDays <= CUSTOM_DAYS_MAX;
 
   let endExclusive: DateTime | null = null;
+  // An early renewal starts when the paid period ends, whatever date is picked before it.
+  const effectiveStart = until && until > DateTime.now() && start < until.toISODate()! ? until.toISODate()! : start;
   try {
-    endExclusive = computeEndExclusive(localStartOfDay(start), plan.duration ?? { unit: 'day', value: customOk ? customDays : 1 });
+    if (plan) endExclusive = computeEndExclusive(localStartOfDay(effectiveStart), plan.duration ?? { unit: 'day', value: customOk ? customDays : 1 });
   } catch {
     endExclusive = null;
   }
-  const q = quote(isCustom ? egp(customPrice || 0) : plan.price, discount);
+  const q = quote(isCustom ? egp(customPrice || 0) : plan?.price ?? 0, discount);
   // Renewing with an unpaid balance: the old balance is added to this order and paid with it.
   const oldBalance = renewing ? balanceOf(renewing.m.id) : null;
   const carried = oldBalance?.remaining ?? 0;
   const due = q.total + carried;
-  const isDayPass = plan.duration?.unit === 'session';
+  const isDayPass = plan?.duration?.unit === 'session';
   const depositAllowed = settings.enabled && !isDayPass;
   const mode: PayMode = depositAllowed ? payMode : 'FULL';
   const pay = planPayment(
@@ -304,24 +362,121 @@ function QuickRegister({ renewId }: { renewId: string | null }) {
   );
   const dueDateOk = mode === 'FULL' || (balanceDue >= dueDates.minDue && balanceDue <= dueDates.maxDue);
   const payErr = (e: PaymentError) => pay.errors.includes(e);
+  const discountOk = Number.isInteger(discount) && discount >= 0 && discount <= 100 && (isAdmin || discount <= settings.cashierMaxDiscount);
 
   const errors = {
     name: !name.trim() ? t('reg.required') : null,
     phone: !e164 ? t('login.invalidPhone') : null,
     days: isCustom && !customOk ? t('reg.daysRange') : null,
   };
-  const valid = !errors.name && !errors.phone && !errors.days && !dupe && endExclusive && pay.errors.length === 0 && dueDateOk;
+  const valid = !!plan && !errors.name && !errors.phone && !errors.days && !dupe && !!endExclusive && pay.errors.length === 0 && dueDateOk && discountOk;
 
-  const submit = (e: FormEvent) => {
+  const submit = async (e: FormEvent) => {
     e.preventDefault();
     setTouched(true);
-    if (valid) server();
+    setErr(null);
+    if (!valid || !plan || !endExclusive) return;
+    const money = (p: number) => formatEGP(p, lang);
+    const planName = lang === 'ar' ? plan.nameAr : plan.nameEn;
+    const lines: [string, string][] = [
+      [t('cashier.plan'), planName],
+      [t('sale.period'), `${fmtDate(localStartOfDay(effectiveStart), 'short')} → ${fmtDate(lastUsableDay(endExclusive), 'short')}`],
+      [t('reg.due'), money(due)],
+      [t('pay.paidNow'), money(pay.paidNow)],
+      ...(pay.remaining > 0 ? ([[t('pay.remaining'), `${money(pay.remaining)} · ${fmtDate(balanceDue, 'short')}`]] as [string, string][]) : []),
+      [t('reg.method'), t(`method.${method}`)],
+    ];
+    const extraText = [
+      `🎫 الباقة: *${plan.nameAr}*`,
+      `📅 من ${fmtDate(localStartOfDay(effectiveStart))} لحد ${fmtDate(lastUsableDay(endExclusive))}`,
+      `💵 المدفوع: *${formatEGP(pay.paidNow, 'ar')}*`,
+      ...(pay.remaining > 0 ? [`💰 المتبقي: *${formatEGP(pay.remaining, 'ar')}* قبل نهاية يوم ${fmtDate(balanceDue)}`] : []),
+    ].join('\n');
+    if (demoMode) {
+      server();
+      return;
+    }
+    setBusy(true);
+    try {
+      let row = renewing ?? null;
+      let newDoc: data.MemberDoc | null = null;
+      if (!row) {
+        const id = await data.newMemberId();
+        const reg = await data.registerMember(actor, { memberId: id, fullName: name, phone });
+        if (reg.existing) {
+          setErr(t('err.phone-registered'));
+          return;
+        }
+        newDoc = { id, memberNo: 0, memberCode: reg.memberCode, fullName: name.trim(), phoneE164: e164!, authUid: null, accountStatus: 'PENDING_ACTIVATION', assignedCoachId: null, blocks: {}, searchTokens: [], createdAt: null, membership: null, balance: null };
+        row = { m: { id, name: name.trim(), code: reg.memberCode, phone: e164!, vip: 'STANDARD', coachId: null, lastCheckIn: null, blocked: false, planId: '' }, phase: 'NONE', start: null, end: null, lastDay: null, planAr: '', planEn: '', coach: null, next: null, cancelled: false, doc: newDoc };
+      }
+      const doc = row.doc;
+      const r = await data.sell(actor, {
+        member: { id: row.m.id, membership: doc?.membership ?? null, balance: doc?.balance ?? null },
+        planId: plan.id,
+        plan: planDocFromPlan(plan, 0),
+        customDays: isCustom ? customDays : null,
+        customPrice: isCustom ? egp(customPrice || 0) : null,
+        startDate: effectiveStart,
+        discountPct: discount,
+        mode,
+        deposit: mode === 'DEPOSIT' ? pay.paidNow : 0,
+        balanceDueDate: mode === 'DEPOSIT' ? balanceDue : null,
+        method,
+        reference: reference || null,
+        settings: settingsDoc,
+      });
+      toast(t('sale.done'), 'success');
+      setDone({ row, receiptNo: r.receiptNo, lines, newMember: newDoc, extraText });
+    } catch (ex) {
+      setErr(errText(ex));
+    } finally {
+      setBusy(false);
+    }
   };
+
+  if (done) {
+    return (
+      <div className="stack" style={{ maxWidth: 560 }}>
+        <h1 className="page-title">{t('sale.doneTitle')}</h1>
+        <ReceiptView
+          lines={done.lines}
+          receiptNo={done.receiptNo}
+          row={done.row}
+          extra={
+            done.newMember ? (
+              <Notice icon="whatsapp">
+                <div className="stack-sm">
+                  <span>{t('sale.loginNext')}</span>
+                  <button type="button" className="btn btn-success btn-sm" style={{ alignSelf: 'flex-start' }} onClick={() => setSendLogin(true)}>
+                    <Icon name="whatsapp" />
+                    {t('sale.loginSend')}
+                  </button>
+                </div>
+              </Notice>
+            ) : null
+          }
+        />
+        <div className="row wrap">
+          <button className="btn btn-primary grow" onClick={() => navigate('/cashier')}>{t('sale.back')}</button>
+          <button className="btn btn-secondary grow" onClick={() => navigate('/cashier/new?again=' + Date.now())}>{t('cashier.newMember')}</button>
+        </div>
+        {sendLogin && done.newMember && <InviteDialog m={done.newMember} purpose="activate" extra={done.extraText} onClose={() => setSendLogin(false)} />}
+      </div>
+    );
+  }
+
+  if (!demoMode && !plansLoading && activePlans.length === 0) {
+    return <Notice tone="warning" icon="alert">{t('sale.noPlans')}</Notice>;
+  }
+  if (renewId && !renewing) {
+    return <p className="muted" aria-busy="true">…</p>;
+  }
 
   return (
     <form className="grid-2" style={{ alignItems: 'start' }} onSubmit={submit} noValidate>
       <section className="card stack">
-        <h1 className="page-title">{renewing ? `${t('cashier.renew')} — ${renewing.m.name}` : t('reg.title')}</h1>
+        <h1 className="page-title">{renewing ? `${renewing.phase === 'NONE' ? t('sale.sellFirst') : t('cashier.renew')} — ${renewing.m.name}` : t('reg.title')}</h1>
         <div className="field">
           <label className="label" htmlFor="n">{t('reg.name')}</label>
           <input id="n" className="input" value={name} onChange={(e) => setName(e.target.value)} disabled={!!renewing} aria-invalid={touched && !!errors.name} autoComplete="off" />
@@ -334,8 +489,8 @@ function QuickRegister({ renewId }: { renewId: string | null }) {
           {dupe && (
             <Notice tone="warning" icon="alert">
               <div className="stack-sm">
-                <span>{t('reg.phoneExists', { name: dupe.name, code: dupe.code })}</span>
-                <button type="button" className="btn btn-secondary btn-sm" style={{ alignSelf: 'flex-start' }} onClick={() => navigate(`/cashier/new?renew=${dupe.id}`)}>
+                <span>{t('reg.phoneExists', { name: dupe.m.name, code: dupe.m.code })}</span>
+                <button type="button" className="btn btn-secondary btn-sm" style={{ alignSelf: 'flex-start' }} onClick={() => navigate(`/cashier/new?renew=${dupe.m.id}`)}>
                   {t('reg.openExisting')}
                 </button>
               </div>
@@ -346,7 +501,7 @@ function QuickRegister({ renewId }: { renewId: string | null }) {
           <span className="label" id="plan-l">{t('reg.plan')}</span>
           <div className="chips" role="group" aria-labelledby="plan-l">
             {activePlans.map((p) => (
-              <button type="button" key={p.id} className="chip" aria-pressed={plan.id === p.id} onClick={() => setPlanId(p.id)}>
+              <button type="button" key={p.id} className="chip" aria-pressed={plan?.id === p.id} onClick={() => setPlanId(p.id)}>
                 {lang === 'ar' ? p.nameAr : p.nameEn}
               </button>
             ))}
@@ -368,24 +523,16 @@ function QuickRegister({ renewId }: { renewId: string | null }) {
         <div className="grid-2">
           <div className="field">
             <label className="label" htmlFor="st">{t('reg.start')}</label>
-            <input id="st" className="input" type="date" value={start} min={renewing ? undefined : todayISO()} onChange={(e) => setStart(e.target.value)} />
+            <input id="st" className="input" type="date" value={effectiveStart} min={until && until > DateTime.now() ? until.toISODate()! : todayISO()} onChange={(e) => setStart(e.target.value)} />
+            {until && until > DateTime.now() && <span className="hint">{t('sale.appendHint', { date: fmtDate(until) })}</span>}
           </div>
           <div className="field">
             <label className="label" htmlFor="ds">{t('reg.discount')}</label>
-            <input id="ds" className="input num" type="number" min={0} max={100} value={discount} onChange={(e) => setDiscount(Number(e.target.value))} />
+            <input id="ds" className="input num" type="number" min={0} max={isAdmin ? 100 : settings.cashierMaxDiscount} value={discount} onChange={(e) => setDiscount(Number(e.target.value))} aria-invalid={!discountOk} />
+            {!discountOk ? <span className="error">{t('sale.err.discount', { n: settings.cashierMaxDiscount })}</span> : !isAdmin && <span className="hint">{t('sale.discountHint', { n: settings.cashierMaxDiscount })}</span>}
           </div>
         </div>
-        <div className="field">
-          <span className="label" id="m-l">{t('reg.method')}</span>
-          <div className="chips" role="group" aria-labelledby="m-l">
-            {(['CASH', 'WALLET', 'INSTAPAY', 'BANK'] as Method[]).map((m) => (
-              <button type="button" key={m} className="chip" aria-pressed={method === m} onClick={() => setMethod(m)}>
-                {t(`method.${m}`)}
-              </button>
-            ))}
-          </div>
-          <span className="hint">{method === 'CASH' ? t('reg.cashNote') : t('reg.transferNote')}</span>
-        </div>
+        <MethodPicker method={method} setMethod={setMethod} reference={reference} setReference={setReference} />
 
         {carried > 0 && oldBalance && (
           <Notice tone="warning" icon="alert">
@@ -440,7 +587,7 @@ function QuickRegister({ renewId }: { renewId: string | null }) {
         <section className="summary stack-sm" aria-live="polite">
           <h2 className="card-title">{t('reg.summary')}</h2>
           <div className="row-between">
-            <span>{lang === 'ar' ? plan.nameAr : plan.nameEn}</span>
+            <span>{plan ? (lang === 'ar' ? plan.nameAr : plan.nameEn) : '—'}</span>
             <span className="num">{formatEGP(q.base, lang)}</span>
           </div>
           {q.discount > 0 && (
@@ -485,14 +632,15 @@ function QuickRegister({ renewId }: { renewId: string | null }) {
             <>
               <div className="row small" style={{ marginTop: 8 }}>
                 <Icon name="calendar" width={18} height={18} />
-                <span>{t('reg.period', { from: fmtDate(localStartOfDay(start)), to: fmtDate(lastUsableDay(endExclusive)) })}</span>
+                <span>{t('reg.period', { from: fmtDate(localStartOfDay(effectiveStart)), to: fmtDate(lastUsableDay(endExclusive)) })}</span>
               </div>
               <span className="muted xs">{t('reg.lastDayNote', { date: fmtDate(lastUsableDay(endExclusive)) })}</span>
             </>
           )}
         </section>
-        <button className="btn btn-primary btn-lg btn-block" type="submit" disabled={touched && !valid}>
-          {t('reg.submit')}
+        {err && <Notice tone="danger" icon="alert">{err}</Notice>}
+        <button className="btn btn-primary btn-lg btn-block" type="submit" disabled={busy || (touched && !valid)} aria-busy={busy}>
+          {renewing ? t('sale.submitRenew') : t('sale.submitNew')}
         </button>
       </aside>
     </form>
@@ -575,7 +723,7 @@ function ScanPage() {
   const d = r
     ? decideEntry({
         now: DateTime.now(),
-        phase: r.phase,
+        phase: r.phase as MembershipPhase,
         cancelled: isCancelled(r.m.id),
         checkinBlocked: !!r.m.blocked,
         codeAlreadyUsed: scan!.reused,

@@ -28,7 +28,7 @@ export class WriteError extends Error {
     super(reason);
   }
 }
-const refuse = (reason: string): never => {
+export const refuse = (reason: string): never => {
   throw new WriteError(reason);
 };
 
@@ -41,7 +41,8 @@ export type BlockScope = (typeof BLOCK_SCOPES)[number];
 export const LICENSE_TYPES = ['TRIAL', 'FIXED', 'LIFETIME'] as const;
 export type LicenseType = (typeof LICENSE_TYPES)[number];
 
-function audit(auditId: string, actorUid: string, action: string, entityType: 'members' | 'users' | 'license' | 'gymPublicConfig' | 'pinSecrets', entityId: string, summary: DocData): WriteOp {
+export type AuditEntity = 'members' | 'users' | 'license' | 'gymPublicConfig' | 'pinSecrets' | 'wipes' | 'plans' | 'gymSettings' | 'memberships' | 'banners' | 'vipTiers' | 'financeEntries' | 'cashCloses' | 'exercises';
+export function audit(auditId: string, actorUid: string, action: string, entityType: AuditEntity, entityId: string, summary: DocData): WriteOp {
   return { type: 'set', path: `auditLogs/${auditId}`, data: { actorUid, action, entityType, entityId, at: SERVER_TIME, summary } };
 }
 
@@ -429,4 +430,49 @@ export function activeBlocks(blocks: Record<string, Partial<BlockEntry>> | undef
   return Object.entries(blocks ?? {})
     .filter(([, b]) => !b.until || new Date(b.until) > now)
     .map(([k]) => k);
+}
+
+// ---------------------------------------------------------------- wiping member data (developer)
+
+/** The word typed to confirm a wipe. */
+export const WIPE_WORD = 'مسح';
+
+export interface WipeCounts {
+  members: number;
+  accounts: number;
+  invites: number;
+  memberships?: number;
+  payments?: number;
+}
+
+/** The record of a wipe, written first (with its audit entry) so it is logged even if a later step stops. */
+export function wipeRecord(i: { actorUid: string; auditId: string; wipeId: string; counts: WipeCounts }): WriteOp[] {
+  return [
+    { type: 'set', path: `wipes/${i.wipeId}`, data: { by: i.actorUid, at: SERVER_TIME, counts: { ...i.counts }, lastAuditId: i.auditId } },
+    audit(i.auditId, i.actorUid, 'data.wipe', 'wipes', i.wipeId, { ...i.counts }),
+  ];
+}
+
+/**
+ * Every document that belongs to members: the member files, their phone index, their sign-in
+ * aliases and profiles, member invites, and the member-number counter. Staff, licence, branding
+ * and the audit log are never included.
+ */
+export function wipeDeletes(i: { members: { id: string; phoneE164: string }[]; memberUserUids: string[]; memberInviteIds: string[]; membershipIds?: string[]; paymentIds?: string[]; extraPaths?: string[] }): DeleteOp[] {
+  const ops: DeleteOp[] = [];
+  for (const m of i.members) {
+    ops.push({ type: 'delete', path: `members/${m.id}` });
+    if (/^\+20(10|11|12|15)\d{8}$/.test(m.phoneE164)) {
+      ops.push({ type: 'delete', path: `phoneIndex/${m.phoneE164}` });
+      ops.push({ type: 'delete', path: `loginAliases/${aliasId('member', m.phoneE164)}` });
+    }
+  }
+  for (const u of i.memberUserUids) ops.push({ type: 'delete', path: `users/${u}` });
+  for (const h of i.memberInviteIds) ops.push({ type: 'delete', path: `invites/${h}` });
+  for (const id of i.membershipIds ?? []) ops.push({ type: 'delete', path: `memberships/${id}` });
+  for (const id of i.paymentIds ?? []) ops.push({ type: 'delete', path: `payments/${id}` });
+  // Member-owned records of later phases (check-ins, codes, workout logs…), by full path.
+  for (const p of i.extraPaths ?? []) ops.push({ type: 'delete', path: p });
+  ops.push({ type: 'delete', path: 'counters/members' });
+  return ops;
 }

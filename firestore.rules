@@ -27,6 +27,12 @@ service cloud.firestore {
     function sessionPath(u) { return /databases/$(database)/documents/staffSessions/$(u); }
     function triesPath(u)   { return /databases/$(database)/documents/pinTries/$(u); }
     function secretPath(u)  { return /databases/$(database)/documents/pinSecrets/$(u); }
+    function planPath(p)    { return /databases/$(database)/documents/plans/$(p); }
+    function settingsPath() { return /databases/$(database)/documents/gymSettings/main; }
+    function msPath(id)     { return /databases/$(database)/documents/memberships/$(id); }
+    function payPath(id)    { return /databases/$(database)/documents/payments/$(id); }
+    function tokenPath(m)   { return /databases/$(database)/documents/checkinTokens/$(m); }
+    function checkinPath(id) { return /databases/$(database)/documents/checkins/$(id); }
 
     // ---------------------------------------------------------------- who is asking
     function signedIn() { return request.auth != null; }
@@ -64,6 +70,9 @@ service cloud.firestore {
       return signedIn() && u != request.auth.uid && t.kind == 'staff'
         && (devMfa() || (hasRole('admin') && licensed() && !('admin' in t.roles)));
     }
+    // Wiping member data: the developer, who re-entered the code + phrase in the last 10 minutes
+    // (re-entering re-opens the session, so its `at` is the time of that check). Staff data is never touched.
+    function devWipe() { return devMfa() && get(sessionPath(request.auth.uid)).data.at > request.time - duration.value(10, 'm'); }
     function frontDeskWriter() { return ((hasRole('admin') || hasRole('cashier')) && licensed()) || devMfa(); }
 
     // A block counts until its `until` time (null = until lifted).
@@ -146,7 +155,8 @@ service cloud.firestore {
       allow create: if aliasWrite(a) && getAfter(invitePath(request.resource.data.inviteId)).data.prevUid == null;
       allow update: if aliasWrite(a) && getAfter(invitePath(request.resource.data.inviteId)).data.prevUid == resource.data.uid;
       // Freed when an admin removes the staff account in the same write.
-      allow delete: if canManageStaff(resource.data.uid) && getAfter(userPath(resource.data.uid)).data.status == 'removed';
+      allow delete: if (canManageStaff(resource.data.uid) && getAfter(userPath(resource.data.uid)).data.status == 'removed')
+        || (a.matches('^m[+]20[0-9]{10}$') && devWipe());
     }
     function aliasWrite(a) {
       let d = request.resource.data;
@@ -171,8 +181,9 @@ service cloud.firestore {
         && ((request.resource.data.kind == 'member' && memberInviteOk())
             || (request.resource.data.kind == 'staff' && staffInviteOk()));
       allow update: if redeeming(h);
-      allow delete: if resource.data.usedAt == null
-        && (adminWriter() || (frontDeskWriter() && resource.data.createdBy == request.auth.uid));
+      allow delete: if (resource.data.usedAt == null
+          && (adminWriter() || (frontDeskWriter() && resource.data.createdBy == request.auth.uid)))
+        || (resource.data.kind == 'member' && devWipe());
     }
     function inviteShape() {
       let d = request.resource.data;
@@ -227,6 +238,7 @@ service cloud.firestore {
       allow list: if isAdmin();
       allow create: if signedIn() && request.auth.uid == u && redeemedProfile(u);
       allow update: if retiredByReset(u) || staffEdit(u);
+      allow delete: if resource.data.kind == 'member' && devWipe();
     }
     function redeemedProfile(u) {
       let d = request.resource.data;
@@ -352,7 +364,10 @@ service cloud.firestore {
       allow get: if isMemberSelf(m) || isFrontDesk() || (isCoach() && resource.data.assignedCoachId == request.auth.uid);
       allow list: if isFrontDesk() || (isCoach() && resource.data.assignedCoachId == request.auth.uid);
       allow create: if frontDeskWriter() && newMember(m);
-      allow update: if memberLinkedByInvite(m) || memberBlocks(m);
+      allow update: if memberLinkedByInvite(m) || memberBlocks(m)
+        || memberSale(m) || memberBalancePay(m) || memberGrant(m) || memberCancel(m)
+        || memberCheckin(m) || memberVip(m) || memberCoach(m);
+      allow delete: if devWipe();
     }
     function newMember(m) {
       let d = request.resource.data;
@@ -406,6 +421,7 @@ service cloud.firestore {
         && request.resource.data.createdAt == request.time
         && getAfter(memberPath(request.resource.data.memberId)).data.createdAt == request.time
         && getAfter(memberPath(request.resource.data.memberId)).data.phoneE164 == p;
+      allow delete: if devWipe();
     }
 
     // Member numbers: each registration moves the counter by exactly one, in the same transaction.
@@ -413,6 +429,19 @@ service cloud.firestore {
       allow get: if isFrontDesk();
       allow create: if c == 'members' && frontDeskWriter() && counterBump(10001);
       allow update: if c == 'members' && frontDeskWriter() && counterBump(resource.data.next);
+      // After a wipe the numbering starts again from 10001.
+      allow delete: if c == 'members' && devWipe();
+    }
+
+    // One record per wipe (who, when, how many), paired with its audit entry.
+    match /wipes/{w} {
+      allow get, list: if isAdmin();
+      allow create: if devWipe()
+        && exactKeys(['by', 'at', 'counts', 'lastAuditId'])
+        && request.resource.data.by == request.auth.uid
+        && request.resource.data.at == request.time
+        && request.resource.data.counts is map && request.resource.data.counts.size() <= 8
+        && freshAudit('data.wipe', 'wipes', w);
     }
     function counterBump(no) {
       let d = request.resource.data;
@@ -421,6 +450,458 @@ service cloud.firestore {
         && d.updatedAt == request.time
         && getAfter(memberPath(d.lastMemberId)).data.createdAt == request.time
         && getAfter(memberPath(d.lastMemberId)).data.memberNo == no;
+    }
+
+    // ================================================================ Phase 3: plans, memberships, payments
+    // Every amount is recomputed here from the plan, the settings and the member file, so a modified
+    // browser cannot change a price, a discount, a deposit or a refund. Money is integer piasters.
+
+    function adminLike() { return hasRole('admin') || devMfa(); }
+
+    // ---------------------------------------------------------------- plans (admin)
+    match /plans/{p} {
+      allow read: if active();
+      allow create, update: if adminWriter() && planShape(p) && freshAudit('plan.set', 'plans', p);
+    }
+    function planShape(p) {
+      let d = request.resource.data;
+      return p.matches('^[A-Za-z0-9_-]{2,40}$')
+        && exactKeys(['code', 'nameAr', 'nameEn', 'unit', 'value', 'visitQuota', 'price', 'featured', 'active', 'sort', 'updatedAt', 'lastAuditId'])
+        && d.code is string && d.code.matches('^[A-Z0-9_-]{2,12}$')
+        && d.nameAr is string && d.nameAr.size() >= 1 && d.nameAr.size() <= 60
+        && d.nameEn is string && d.nameEn.size() >= 1 && d.nameEn.size() <= 60
+        && d.unit in ['session', 'day', 'week', 'month', 'year', 'custom']
+        && d.value is int && d.value >= 1 && d.value <= 730
+        && (d.visitQuota == null || (d.visitQuota is int && d.visitQuota >= 1 && d.visitQuota <= 1000))
+        && d.price is int
+        && ((d.unit == 'custom' && d.price == 0) || (d.unit != 'custom' && d.price > 0 && d.price <= 100000000))
+        && d.featured is bool && d.active is bool
+        && d.sort is int && d.sort >= 0 && d.sort <= 1000
+        && d.updatedAt == request.time;
+    }
+
+    // ---------------------------------------------------------------- gym settings (admin)
+    match /gymSettings/{s} {
+      allow read: if isStaff();
+      allow create, update: if s == 'main' && adminWriter() && settingsShape() && freshAudit('settings.set', 'gymSettings', 'main');
+    }
+    function settingsShape() {
+      let d = request.resource.data;
+      return exactKeys(['depositEnabled', 'depositMinPercent', 'depositGraceDays', 'depositMaxGraceDays', 'cashierMaxDiscount', 'updatedAt', 'lastAuditId'])
+        && d.depositEnabled is bool
+        && d.depositMinPercent is int && d.depositMinPercent >= 10 && d.depositMinPercent <= 90
+        && d.depositGraceDays is int && d.depositGraceDays >= 1 && d.depositGraceDays <= 60
+        && d.depositMaxGraceDays is int && d.depositMaxGraceDays >= d.depositGraceDays && d.depositMaxGraceDays <= 60
+        && d.cashierMaxDiscount is int && d.cashierMaxDiscount >= 0 && d.cashierMaxDiscount <= 100
+        && d.updatedAt == request.time;
+    }
+    function settings() { return get(settingsPath()).data; }
+
+    // ---------------------------------------------------------------- memberships
+    match /memberships/{id} {
+      allow read: if ownsMemberDoc() || isFrontDesk();
+      allow create: if frontDeskWriter() && sellOk(id);
+      allow update: if cancelOk(id);
+      allow delete: if devWipe();
+    }
+    // The period that counts on a member file: the membership, or what it was appended to if cancelled.
+    function effPeriod(c) { return c == null ? null : (c.status == 'ACTIVE' ? c : c.prev); }
+    function sellOk(id) {
+      let d = request.resource.data;
+      let p = get(planPath(d.planId)).data;
+      let m = get(memberPath(d.memberId)).data;
+      let bal = m.get('balance', null);
+      let cur = effPeriod(m.get('membership', null));
+      return exactKeys(['memberId', 'planId', 'plan', 'customDays', 'startsAt', 'endsAt', 'base', 'discountPct', 'discount', 'carried', 'due', 'paidNow', 'mode', 'balanceDueAt', 'method', 'reference', 'receiptNo', 'paymentId', 'renewal', 'status', 'cancel', 'createdBy', 'createdAt', 'updatedAt', 'lastAuditId'])
+        && p.active == true
+        && d.renewal == (m.get('membership', null) != null)
+        && d.plan == {'code': p.code, 'nameAr': p.nameAr, 'nameEn': p.nameEn, 'unit': p.unit, 'value': p.value, 'price': p.price, 'visitQuota': p.visitQuota}
+        // price: the plan's, or a typed price for a custom-length plan
+        && ((p.unit == 'custom' && d.customDays is int && d.customDays >= 1 && d.customDays <= 730
+              && d.base is int && d.base >= 0 && d.base <= 100000000)
+            || (p.unit != 'custom' && d.customDays == null && d.base == p.price))
+        // discount: cashiers up to the admin's limit, admins any
+        && d.discountPct is int && d.discountPct >= 0 && d.discountPct <= 100
+        // discount = floor(base × % / 100), written without division
+        && d.discount is int && d.discount * 100 <= d.base * d.discountPct && d.base * d.discountPct < (d.discount + 1) * 100
+        && (d.discountPct == 0 || adminLike() || d.discountPct <= settings().cashierMaxDiscount)
+        // an unpaid balance is carried into this sale
+        && d.carried == (bal == null ? 0 : bal.remaining)
+        && d.due == d.base - d.discount + d.carried
+        // full payment, or a deposit within the admin's settings
+        && ((d.mode == 'FULL' && d.paidNow == d.due && d.balanceDueAt == null)
+            || (d.mode == 'DEPOSIT' && p.unit != 'session' && settings().depositEnabled == true
+                && d.paidNow is int && d.paidNow < d.due
+                && d.paidNow * 100 >= d.due * settings().depositMinPercent
+                && d.balanceDueAt is timestamp
+                && d.balanceDueAt > request.time + duration.value(1, 'd')
+                && d.balanceDueAt <= request.time + duration.value(settings().depositMaxGraceDays + 2, 'd')))
+        && d.method in ['CASH', 'WALLET', 'INSTAPAY', 'BANK']
+        && (d.reference == null || (d.method != 'CASH' && d.reference is string && d.reference.size() >= 1 && d.reference.size() <= 40))
+        && d.receiptNo is string && d.receiptNo.matches('^R-[0-9]{6}-[0-9A-Z]{5}$')
+        && d.paymentId is string
+        // dates: from today (no back-dating), appended to a running period, with the plan's length
+        && d.startsAt is timestamp && d.endsAt is timestamp
+        && d.startsAt >= request.time - duration.value(1, 'd')
+        && d.startsAt <= request.time + duration.value(62, 'd')
+        && (cur == null || cur.endsAt <= request.time || d.startsAt >= cur.endsAt)
+        && lengthOk(d, p)
+        && d.status == 'ACTIVE' && d.cancel == null
+        && d.createdBy == request.auth.uid && d.createdAt == request.time && d.updatedAt == request.time
+        && getAfter(memberPath(d.memberId)).data.membership.id == id
+        // the receipt is written in the same request, so every sale shows in the day's cash
+        && getAfter(payPath(d.paymentId)).data.membershipId == id
+        && freshAudit('membership.sell', 'memberships', id);
+    }
+    // Day/week/custom: whole calendar days (±1h for daylight saving). Month/year: calendar months.
+    function lengthOk(d, p) {
+      let days = p.unit == 'session' ? 1 : (p.unit == 'day' ? p.value : (p.unit == 'week' ? 7 * p.value : (p.unit == 'custom' ? d.customDays : 0)));
+      return (days > 0
+              && d.endsAt >= d.startsAt + duration.value(days * 24 - 1, 'h')
+              && d.endsAt <= d.startsAt + duration.value(days * 24 + 1, 'h'))
+        || (p.unit == 'month' && d.endsAt >= d.startsAt + duration.value(28 * p.value, 'd') && d.endsAt <= d.startsAt + duration.value(31 * p.value + 2, 'd'))
+        || (p.unit == 'year' && d.endsAt >= d.startsAt + duration.value(365 * p.value, 'd') && d.endsAt <= d.startsAt + duration.value(366 * p.value + 2, 'd'));
+    }
+    // Cancellation by an admin: refund at most what was paid on this membership.
+    function cancelOk(id) {
+      let r = resource.data;
+      let d = request.resource.data;
+      let c = d.cancel;
+      let m = get(memberPath(r.memberId)).data;
+      let bal = m.get('balance', null);
+      let paid = r.due - ((bal != null && bal.membershipId == id) ? bal.remaining : 0);
+      return adminWriter()
+        && r.status == 'ACTIVE' && d.status == 'CANCELLED'
+        && onlyChanges(['status', 'cancel', 'updatedAt', 'lastAuditId'])
+        && m.membership.id == id
+        && c.keys().hasOnly(['by', 'at', 'refund', 'overridden', 'reason', 'paymentId']) && c.keys().hasAll(['by', 'at', 'refund', 'overridden', 'reason', 'paymentId'])
+        && c.by == request.auth.uid && c.at == request.time
+        && c.refund is int && c.refund >= 0 && c.refund <= paid
+        && c.overridden is bool
+        && c.reason is string && c.reason.size() >= 1 && c.reason.size() <= 200
+        && ((c.refund == 0 && c.paymentId == null)
+            || (c.refund > 0 && c.paymentId is string && getAfter(payPath(c.paymentId)).data.amount == c.refund))
+        && getAfter(memberPath(r.memberId)).data.membership.status == 'CANCELLED'
+        && d.updatedAt == request.time
+        && freshAudit('membership.cancel', 'memberships', id);
+    }
+
+    // ---------------------------------------------------------------- the member file follows each money write
+    function memberSale(m) {
+      let d = request.resource.data;
+      let s = getAfter(msPath(d.membership.id)).data;
+      let cur = effPeriod(resource.data.get('membership', null));
+      return frontDeskWriter()
+        && onlyChanges(['membership', 'balance', 'lastPaymentId', 'updatedAt', 'lastAuditId'])
+        && s.memberId == m && s.createdAt == request.time
+        && d.membership == {'id': d.membership.id, 'planNameAr': s.plan.nameAr, 'planNameEn': s.plan.nameEn, 'unit': s.plan.unit,
+                            'startsAt': s.startsAt, 'endsAt': s.endsAt, 'status': 'ACTIVE',
+                            'visitQuota': s.plan.visitQuota, 'visitsUsed': 0,
+                            'prev': (cur != null && cur.endsAt > request.time)
+                              ? {'planNameAr': cur.planNameAr, 'planNameEn': cur.planNameEn, 'startsAt': cur.startsAt, 'endsAt': cur.endsAt}
+                              : null}
+        && d.balance == (s.paidNow < s.due
+              ? {'remaining': s.due - s.paidNow, 'total': s.due, 'dueAt': s.balanceDueAt, 'membershipId': d.membership.id, 'graceUntil': null, 'graceReason': ''}
+              : null)
+        && d.lastPaymentId == s.paymentId
+        && d.updatedAt == request.time && d.lastAuditId == s.lastAuditId;
+    }
+    function memberBalancePay(m) {
+      let d = request.resource.data;
+      let b = resource.data.balance;
+      let pay = getAfter(payPath(d.lastPaymentId)).data;
+      return frontDeskWriter()
+        && onlyChanges(['balance', 'lastPaymentId', 'updatedAt', 'lastAuditId'])
+        && b != null
+        && pay.kind == 'BALANCE' && pay.memberId == m && pay.at == request.time
+        && pay.amount is int && pay.amount > 0 && pay.amount <= b.remaining
+        && d.balance == (pay.amount == b.remaining ? null
+              : {'remaining': b.remaining - pay.amount, 'total': b.total, 'dueAt': b.dueAt, 'membershipId': b.membershipId, 'graceUntil': b.graceUntil, 'graceReason': b.graceReason})
+        && d.updatedAt == request.time
+        && freshAudit('balance.pay', 'members', m);
+    }
+    function memberGrant(m) {
+      let d = request.resource.data;
+      let b = resource.data.balance;
+      let g = d.balance;
+      return adminWriter()
+        && onlyChanges(['balance', 'updatedAt', 'lastAuditId'])
+        && b != null && g != null
+        && g.remaining == b.remaining && g.total == b.total && g.dueAt == b.dueAt && g.membershipId == b.membershipId
+        && g.keys().hasOnly(['remaining', 'total', 'dueAt', 'membershipId', 'graceUntil', 'graceReason'])
+        && g.graceReason is string && g.graceReason.size() <= 200
+        && ((g.graceUntil == null && g.graceReason == '' && freshAudit('balance.revoke', 'members', m))
+            || (g.graceUntil is timestamp && g.graceUntil > request.time
+                && g.graceUntil <= request.time + duration.value(32, 'd')
+                && g.graceReason.size() >= 1 && freshAudit('balance.grant', 'members', m)))
+        && d.updatedAt == request.time;
+    }
+    function memberCancel(m) {
+      let d = request.resource.data;
+      let cur = resource.data.membership;
+      let s = getAfter(msPath(cur.id)).data;
+      let bal = resource.data.get('balance', null);
+      return adminWriter()
+        && onlyChanges(['membership', 'balance', 'updatedAt', 'lastAuditId'])
+        && s.status == 'CANCELLED' && s.updatedAt == request.time
+        && cur.status == 'ACTIVE'
+        && d.membership.diff(cur).affectedKeys().hasOnly(['status']) && d.membership.status == 'CANCELLED'
+        && d.balance == ((bal != null && bal.membershipId == cur.id) ? null : bal)
+        && d.updatedAt == request.time && d.lastAuditId == s.lastAuditId;
+    }
+
+    // ---------------------------------------------------------------- payments (receipts): append-only
+    match /payments/{id} {
+      allow read: if ownsMemberDoc() || isFrontDesk();
+      allow create: if paymentShape() && (saleReceipt(id) || balanceReceipt(id) || refundReceipt(id));
+      allow delete: if devWipe();
+    }
+    function paymentShape() {
+      let d = request.resource.data;
+      return exactKeys(['memberId', 'membershipId', 'kind', 'amount', 'method', 'reference', 'receiptNo', 'by', 'at'])
+        && d.amount is int && d.amount >= 0 && d.amount <= 100000000
+        && d.method in ['CASH', 'WALLET', 'INSTAPAY', 'BANK']
+        && (d.reference == null || (d.method != 'CASH' && d.reference is string && d.reference.size() >= 1 && d.reference.size() <= 40))
+        && d.receiptNo is string && d.receiptNo.matches('^R-[0-9]{6}-[0-9A-Z]{5}$')
+        && d.by == request.auth.uid && d.at == request.time;
+    }
+    function saleReceipt(id) {
+      let d = request.resource.data;
+      let s = getAfter(msPath(d.membershipId)).data;
+      return d.kind == 'SALE' && frontDeskWriter()
+        && s.paymentId == id && s.createdAt == request.time
+        && d.amount == s.paidNow && d.memberId == s.memberId
+        && d.method == s.method && d.reference == s.reference && d.receiptNo == s.receiptNo;
+    }
+    function balanceReceipt(id) {
+      let d = request.resource.data;
+      let after = getAfter(memberPath(d.memberId)).data;
+      return d.kind == 'BALANCE' && frontDeskWriter()
+        && after.lastPaymentId == id && after.updatedAt == request.time
+        && d.membershipId == get(memberPath(d.memberId)).data.balance.membershipId;
+    }
+    function refundReceipt(id) {
+      let d = request.resource.data;
+      let s = getAfter(msPath(d.membershipId)).data;
+      return d.kind == 'REFUND' && adminWriter()
+        && s.cancel.paymentId == id && s.updatedAt == request.time
+        && d.amount == s.cancel.refund && d.memberId == s.memberId && d.reference == null;
+    }
+
+    // ================================================================ Phase 4: check-in at the door
+    // The member app writes a fresh random code; the cashier's scan is one atomic write and these
+    // rules decide entry from the member file: a membership covering now, visits left, no block,
+    // no late balance (unless an admin allowed it), a fresh unused code, not twice within 2 minutes.
+    match /checkinTokens/{m} {
+      allow get: if isMemberSelf(m) || isFrontDesk();
+      allow create, update: if (isMemberSelf(m)
+            && exactKeys(['code', 'at', 'usedAt'])
+            && request.resource.data.code is string && request.resource.data.code.matches('^[A-Z2-9]{8}$')
+            && request.resource.data.at == request.time && request.resource.data.usedAt == null)
+        || (frontDeskWriter() && resource != null && resource.data.usedAt == null
+            && onlyChanges(['usedAt']) && request.resource.data.usedAt == request.time
+            && getAfter(memberPath(m)).data.lastCheckInAt == request.time);
+      allow delete: if devWipe();
+    }
+    match /checkins/{id} {
+      allow read: if ownsMemberDoc() || isFrontDesk();
+      allow create: if frontDeskWriter() && checkinOk(id);
+      allow delete: if devWipe();
+    }
+    function coversNow(c) {
+      return (c.status == 'ACTIVE' && c.startsAt <= request.time && request.time < c.endsAt
+              && (c.get('visitQuota', null) == null || c.get('visitsUsed', 0) < c.visitQuota))
+        || (c.prev != null && c.prev.startsAt <= request.time && request.time < c.prev.endsAt);
+    }
+    function checkinOk(id) {
+      let d = request.resource.data;
+      let m = get(memberPath(d.memberId)).data;
+      let c = m.get('membership', null);
+      let bal = m.get('balance', null);
+      let last = m.get('lastCheckInAt', null);
+      let after = getAfter(memberPath(d.memberId)).data;
+      return exactKeys(['memberId', 'method', 'code', 'membershipId', 'by', 'at'])
+        && d.by == request.auth.uid && d.at == request.time
+        && c != null && coversNow(c) && d.membershipId == c.id
+        && !blockedNow(m.blocks, 'CHECKIN_BLOCK') && !blockedNow(m.blocks, 'TEMPORARY_SUSPENSION')
+        && (bal == null || request.time < bal.dueAt || (bal.graceUntil != null && request.time < bal.graceUntil))
+        && (last == null || request.time > last + duration.value(2, 'm'))
+        && ((d.method == 'MANUAL' && d.code == null)
+            || (d.method == 'QR' && d.code is string && tokenOk(d.memberId, d.code)))
+        && after.lastCheckInAt == request.time && after.lastCheckinId == id;
+    }
+    function tokenOk(m, code) {
+      let tk = get(tokenPath(m)).data;
+      return tk.code == code && tk.usedAt == null && request.time < tk.at + duration.value(90, 's')
+        && getAfter(tokenPath(m)).data.usedAt == request.time;
+    }
+    // The member file records the visit; only a limited plan's counter moves (by one).
+    function memberCheckin(m) {
+      let d = request.resource.data;
+      let r = resource.data;
+      let ci = getAfter(checkinPath(d.lastCheckinId)).data;
+      let c = r.membership;
+      let counts = c.status == 'ACTIVE' && c.startsAt <= request.time && request.time < c.endsAt && c.get('visitQuota', null) != null;
+      return frontDeskWriter()
+        && ci.memberId == m && ci.at == request.time && d.lastCheckInAt == request.time
+        && ((!counts && onlyChanges(['lastCheckInAt', 'lastCheckinId']))
+            || (counts && onlyChanges(['lastCheckInAt', 'lastCheckinId', 'membership'])
+                && d.membership.diff(c).affectedKeys().hasOnly(['visitsUsed'])
+                && d.membership.visitsUsed == c.get('visitsUsed', 0) + 1));
+    }
+    // VIP tier on a member file (admin).
+    function memberVip(m) {
+      let d = request.resource.data;
+      return adminWriter()
+        && onlyChanges(['vipTierId', 'updatedAt', 'lastAuditId'])
+        && (d.vipTierId == null || d.vipTierId in ['PLUS', 'ELITE'])
+        && d.updatedAt == request.time
+        && freshAudit('member.vip', 'members', m);
+    }
+
+    // ================================================================ Phase 5: coaches and programmes
+    // A coach writes only for members assigned to them; the admin assigns coaches and edits any plan;
+    // the member reads their own plans and writes only their own logs. One document per member each.
+    function coachOf(m) { return hasRole('coach') && licensed() && get(memberPath(m)).data.assignedCoachId == request.auth.uid; }
+    function coachReads(m) { return isCoach() && get(memberPath(m)).data.assignedCoachId == request.auth.uid; }
+    function planWriter(m) { return coachOf(m) || adminWriter(); }
+    function planBase(m) {
+      let d = request.resource.data;
+      return d.memberId == m && d.by == request.auth.uid && d.updatedAt == request.time
+        && d.coachId is string && (d.coachId == request.auth.uid || adminWriter())
+        && d.title is string && d.title.size() >= 1 && d.title.size() <= 60;
+    }
+    match /workoutPlans/{m} {
+      allow get: if isMemberSelf(m) || isAdmin() || coachReads(m);
+      allow create, update: if planWriter(m) && planBase(m)
+        && exactKeys(['memberId', 'coachId', 'title', 'days', 'notes', 'updatedAt', 'by'])
+        && request.resource.data.days is list && request.resource.data.days.size() <= 7
+        && request.resource.data.notes is string && request.resource.data.notes.size() <= 500;
+      allow delete: if devWipe() || planWriter(m);
+    }
+    match /nutritionPlans/{m} {
+      allow get: if isMemberSelf(m) || isAdmin() || coachReads(m);
+      allow create, update: if planWriter(m) && planBase(m)
+        && exactKeys(['memberId', 'coachId', 'title', 'meals', 'notes', 'updatedAt', 'by'])
+        && request.resource.data.meals is list && request.resource.data.meals.size() <= 8
+        && request.resource.data.notes is string && request.resource.data.notes.size() <= 800;
+      allow delete: if devWipe() || planWriter(m);
+    }
+    match /workoutLogs/{m} {
+      allow get: if isMemberSelf(m) || isAdmin() || coachReads(m);
+      allow create, update: if isMemberSelf(m)
+        && exactKeys(['memberId', 'days', 'updatedAt'])
+        && request.resource.data.memberId == m && request.resource.data.updatedAt == request.time
+        && request.resource.data.days is map && request.resource.data.days.size() <= 120;
+      allow delete: if devWipe();
+    }
+    match /bodyLogs/{m} {
+      allow get: if isMemberSelf(m) || isAdmin() || coachReads(m);
+      allow create, update: if (isMemberSelf(m) || planWriter(m))
+        && exactKeys(['memberId', 'entries', 'updatedAt'])
+        && request.resource.data.memberId == m && request.resource.data.updatedAt == request.time
+        && request.resource.data.entries is list && request.resource.data.entries.size() <= 200;
+      allow delete: if devWipe();
+    }
+    match /exercises/{e} {
+      allow read: if isStaff();
+      allow create, update: if (hasRole('coach') || adminWriter())
+        && e.matches('^[A-Za-z0-9_-]{2,40}$')
+        && exactKeys(['nameAr', 'nameEn', 'muscle', 'tips', 'updatedAt', 'by'])
+        && request.resource.data.nameAr is string && request.resource.data.nameAr.size() >= 1 && request.resource.data.nameAr.size() <= 60
+        && request.resource.data.nameEn is string && request.resource.data.nameEn.size() <= 60
+        && request.resource.data.muscle in ['chest', 'back', 'legs', 'shoulders', 'arms', 'core', 'cardio', 'full']
+        && request.resource.data.tips is string && request.resource.data.tips.size() <= 300
+        && request.resource.data.by == request.auth.uid && request.resource.data.updatedAt == request.time;
+      allow delete: if hasRole('coach') || adminWriter();
+    }
+    // The admin assigns a coach (an active staff account with the coach role); the name goes on the file.
+    function memberCoach(m) {
+      let d = request.resource.data;
+      return adminWriter()
+        && onlyChanges(['assignedCoachId', 'assignedCoachName', 'updatedAt', 'lastAuditId'])
+        && ((d.assignedCoachId == null && d.assignedCoachName == null)
+            || (d.assignedCoachId is string && coachAccount(d.assignedCoachId, d.assignedCoachName)))
+        && d.updatedAt == request.time
+        && freshAudit('member.coach', 'members', m);
+    }
+    function coachAccount(u, name) {
+      let c = get(userPath(u)).data;
+      return c.kind == 'staff' && c.status == 'active' && 'coach' in c.roles && c.displayName == name;
+    }
+
+    // ================================================================ Phase 6: books and cash
+    // Income/expense entries are append-only; an admin voids a mistake with a reason (never edits it).
+    function bookWriter() { return adminWriter() || (hasRole('accountant') && licensed()); }
+    match /financeEntries/{e} {
+      allow read: if isAdmin() || isAccountant();
+      allow create: if bookWriter() && financeShape() && freshAudit('finance.add', 'financeEntries', e);
+      allow update: if adminWriter()
+        && resource.data.status == 'ACTIVE'
+        && onlyChanges(['status', 'voidReason', 'voidedBy', 'voidedAt', 'lastAuditId'])
+        && request.resource.data.status == 'VOID'
+        && request.resource.data.voidReason is string && request.resource.data.voidReason.size() >= 1 && request.resource.data.voidReason.size() <= 200
+        && request.resource.data.voidedBy == request.auth.uid && request.resource.data.voidedAt == request.time
+        && freshAudit('finance.void', 'financeEntries', e);
+    }
+    function financeShape() {
+      let d = request.resource.data;
+      return exactKeys(['kind', 'category', 'amount', 'method', 'date', 'note', 'status', 'voidReason', 'voidedBy', 'voidedAt', 'by', 'at', 'lastAuditId'])
+        && ((d.kind == 'EXPENSE' && d.category in ['rent', 'salaries', 'utilities', 'equipment', 'maintenance', 'supplies', 'marketing', 'other'])
+            || (d.kind == 'INCOME' && d.category in ['products', 'personal_training', 'lockers', 'other']))
+        && d.amount is int && d.amount > 0 && d.amount <= 100000000
+        && d.method in ['CASH', 'WALLET', 'INSTAPAY', 'BANK']
+        && d.date is string && d.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && d.note is string && d.note.size() <= 200
+        && d.status == 'ACTIVE' && d.voidReason == '' && d.voidedBy == null && d.voidedAt == null
+        && d.by == request.auth.uid && d.at == request.time;
+    }
+    // A cashier closes their own drawer once per day (the id is uid_date, and closes are never edited).
+    match /cashCloses/{c} {
+      allow get, list: if isAdmin() || isAccountant() || (isStaff() && resource.data.by == request.auth.uid);
+      allow create: if frontDeskWriter()
+        && exactKeys(['date', 'by', 'expected', 'counted', 'diff', 'note', 'at', 'lastAuditId'])
+        && request.resource.data.date is string && request.resource.data.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && c == request.auth.uid + '_' + request.resource.data.date
+        && request.resource.data.by == request.auth.uid
+        && request.resource.data.expected is int && request.resource.data.counted is int
+        && request.resource.data.counted >= 0 && request.resource.data.counted <= 100000000
+        && request.resource.data.diff == request.resource.data.counted - request.resource.data.expected
+        && request.resource.data.note is string && request.resource.data.note.size() <= 200
+        && request.resource.data.at == request.time
+        && freshAudit('cash.close', 'cashCloses', c);
+    }
+
+    // ================================================================ content: banners and VIP tiers (admin)
+    match /banners/{b} {
+      allow read: if (active() && resource.data.status == 'PUBLISHED') || isAdmin();
+      allow create, update: if adminWriter() && bannerShape(b) && freshAudit('banner.set', 'banners', b);
+    }
+    function bannerShape(b) {
+      let d = request.resource.data;
+      return b.matches('^[A-Za-z0-9_-]{2,40}$')
+        && exactKeys(['title', 'body', 'tag', 'tone', 'figure', 'status', 'vipOnly', 'sort', 'endsAt', 'updatedAt', 'lastAuditId'])
+        && d.title is string && d.title.size() >= 2 && d.title.size() <= 60
+        && d.body is string && d.body.size() <= 140
+        && d.tag is string && d.tag.size() >= 1 && d.tag.size() <= 20
+        && d.tone in ['primary', 'vip', 'info']
+        && d.figure in ['curl', 'abs', 'ropes', 'squat', 'flex', 'gear']
+        && d.status in ['PUBLISHED', 'DRAFT', 'ARCHIVED']
+        && d.vipOnly is bool
+        && d.sort is int && d.sort >= 0 && d.sort <= 1000
+        && (d.endsAt == null || d.endsAt is timestamp)
+        && d.updatedAt == request.time;
+    }
+    match /vipTiers/{v} {
+      allow read: if active();
+      allow create, update: if v in ['PLUS', 'ELITE'] && adminWriter()
+        && exactKeys(['nameAr', 'nameEn', 'perksAr', 'perksEn', 'updatedAt', 'lastAuditId'])
+        && request.resource.data.nameAr is string && request.resource.data.nameAr.size() >= 1 && request.resource.data.nameAr.size() <= 30
+        && request.resource.data.nameEn is string && request.resource.data.nameEn.size() >= 1 && request.resource.data.nameEn.size() <= 30
+        && request.resource.data.perksAr is string && request.resource.data.perksAr.size() <= 600
+        && request.resource.data.perksEn is string && request.resource.data.perksEn.size() <= 600
+        && request.resource.data.updatedAt == request.time
+        && freshAudit('vip.tier', 'vipTiers', v);
     }
 
     // ---------------------------------------------------------------- audit log (append-only)
@@ -440,27 +921,23 @@ service cloud.firestore {
             || (d.entityType == 'users' && getAfter(userPath(d.entityId)).data.lastAuditId == aid)
             || (d.entityType == 'license' && d.entityId == 'main' && getAfter(licensePath()).data.lastAuditId == aid)
             || (d.entityType == 'gymPublicConfig' && d.entityId == 'main' && getAfter(configPath()).data.lastAuditId == aid)
-            || (d.entityType == 'pinSecrets' && getAfter(secretPath(d.entityId)).data.lastAuditId == aid));
+            || (d.entityType == 'pinSecrets' && getAfter(secretPath(d.entityId)).data.lastAuditId == aid)
+            || (d.entityType == 'wipes' && getAfter(/databases/$(database)/documents/wipes/$(d.entityId)).data.lastAuditId == aid)
+            || (d.entityType == 'plans' && getAfter(planPath(d.entityId)).data.lastAuditId == aid)
+            || (d.entityType == 'gymSettings' && d.entityId == 'main' && getAfter(settingsPath()).data.lastAuditId == aid)
+            || (d.entityType == 'memberships' && getAfter(msPath(d.entityId)).data.lastAuditId == aid)
+            || (d.entityType in ['banners', 'vipTiers', 'financeEntries', 'cashCloses', 'exercises']
+                && getAfter(/databases/$(database)/documents/$(d.entityType)/$(d.entityId)).data.lastAuditId == aid));
     }
 
     // ---------------------------------------------------------------- later phases: read-only for now
     // Writes for these collections arrive with their phase (orders and payments in Phase 3, and so on),
     // each with its own rules and tests. Until then nobody can write them.
-    match /memberships/{id}      { allow read: if ownsMemberDoc() || isFrontDesk() || (isCoach() && resource.data.assignedCoachId == request.auth.uid); }
     match /membershipEvents/{id} { allow read: if isFrontDesk(); }
     match /orders/{id}           { allow read: if ownsMemberDoc() || isFrontDesk(); }
-    match /payments/{id}         { allow read: if ownsMemberDoc() || isFrontDesk(); }
-    match /financeEntries/{id}   { allow read: if isAdmin() || isAccountant(); }
     match /cashSessions/{id}     { allow read: if isAdmin() || isAccountant() || (isCashier() && resource.data.cashierId == request.auth.uid); }
-    match /checkins/{id}         { allow read: if ownsMemberDoc() || isFrontDesk(); }
-    match /plans/{id}            { allow read: if active(); }
     match /offers/{id}           { allow read: if active(); }
     match /paymentMethods/{id}   { allow read: if active(); }
-    match /vipTiers/{id}         { allow read: if active(); }
-    match /gymSettings/{id}      { allow read: if isStaff(); }
-    match /banners/{id}          { allow read: if (active() && resource.data.status == 'PUBLISHED') || isAdmin(); }
-    match /workoutPlans/{id}     { allow read: if ownsMemberDoc() || isAdmin() || (isCoach() && resource.data.coachId == request.auth.uid); }
-    match /nutritionPlans/{id}   { allow read: if ownsMemberDoc() || isAdmin() || (isCoach() && resource.data.coachId == request.auth.uid); }
     match /notifications/{id}    { allow read: if signedIn() && resource.data.recipientId == request.auth.uid; }
   }
 }
