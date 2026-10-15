@@ -131,6 +131,7 @@ export const AR2 = {
   'login.signedInAs': 'إنت داخل بالفعل باسم {name}.',
   'login.goHome': 'فتح التطبيق',
   'login.switch': 'تسجيل خروج',
+  'app.switchArea': 'وظايفك',
   'login.devEmail': 'البريد الإلكتروني للمبرمج',
 
   'dev.staffTitle': 'حسابات الإدارة',
@@ -595,6 +596,7 @@ export const EN2: Record<keyof typeof AR2, string> = {
   'login.signedInAs': 'You are already signed in as {name}.',
   'login.goHome': 'Open the app',
   'login.switch': 'Sign out',
+  'app.switchArea': 'Your jobs',
   'login.devEmail': 'Developer email',
 
   'dev.staffTitle': 'Management accounts',

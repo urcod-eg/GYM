@@ -117,6 +117,16 @@ export function useActor() {
   return useMemo(() => ({ uid: s.user?.uid ?? 'demo', roles: demoMode ? ['admin', 'cashier', 'developer'] : s.roles }), [s.user, s.roles]);
 }
 
+/** The staff areas an account may open (same as the route guards in main.tsx), in menu order. */
+export function staffAreas(roles: string[]): ('admin' | 'cashier' | 'coach')[] {
+  const has = (...r: string[]) => r.some((x) => roles.includes(x));
+  const out: ('admin' | 'cashier' | 'coach')[] = [];
+  if (has('admin', 'accountant', 'developer')) out.push('admin');
+  if (has('cashier', 'admin', 'developer')) out.push('cashier');
+  if (has('coach', 'admin', 'developer')) out.push('coach');
+  return out;
+}
+
 /** Where each role lands after signing in. */
 export function homeFor(roles: string[]): string {
   if (roles.includes('developer')) return '/dev';

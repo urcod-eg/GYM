@@ -6,7 +6,7 @@ import { GymLogoButton, UrcodLogo } from './Brand';
 import { Icon, type IconName } from './Icon';
 import { Notice, Toasts } from './ui';
 import { demoMode } from '../firebase/client';
-import { useSession } from '../app/SessionContext';
+import { staffAreas, useSession } from '../app/SessionContext';
 import type { StringKey } from '../i18n/strings';
 
 declare const __APP_VERSION__: string;
@@ -118,8 +118,22 @@ export function Shell({ children, nav, bottomNav, defaultTheme, showCloud, width
   // A path ending in $ matches exactly (an area's index page without its sub-pages).
   const sample = !demoMode && !livePaths.some((p) => (p.endsWith('$') ? pathname === p.slice(0, -1) : pathname === p || pathname.startsWith(p + '/')));
 
+  // One account can hold several jobs (e.g. cashier + coach): let it move between their screens.
+  const areaIcon = { admin: 'shield', cashier: 'wallet', coach: 'dumbbell' } as const;
+  const areas = demoMode ? [] : staffAreas(session.roles);
   const navList = nav && (
     <nav className="stack-sm" style={{ gap: 2 }} aria-label={title ?? name}>
+      {areas.length > 1 && (
+        <div className="stack-sm area-switch" style={{ gap: 2, paddingBottom: 8, marginBottom: 6, borderBottom: '1px solid var(--border)' }}>
+          <span className="xs muted nav-label" style={{ padding: '0 10px' }}>{t('app.switchArea')}</span>
+          {areas.map((a) => (
+            <NavLink key={a} to={ROLE_HOME[a]} className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`} title={t(`role.${a}`)}>
+              <Icon name={areaIcon[a]} />
+              <span className="nav-label">{t(`role.${a}`)}</span>
+            </NavLink>
+          ))}
+        </div>
+      )}
       {nav.map((n) => (
         <NavLink key={n.to} to={n.to} end={n.end} className={({ isActive }) => `nav-link ${isActive ? 'active' : ''}`} title={n.label}>
           <Icon name={n.icon} />
